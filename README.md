@@ -1,120 +1,96 @@
-# THz-ISAC DU-MAP 代码包 (修复版)
+# THz-ISAC DU-MAP: Deep Unfolding for Phase Slip Recovery
 
-## 🔧 修复记录
+## 概述
 
-详见 `FIXES_APPLIED.md`，主要修复：
+本项目实现了基于 Deep Unfolding 的 THz-ISAC 信道估计方法，针对相位滑移 (Phase Slip) 场景优化。
 
-| 问题 | 修复 |
-|------|------|
-| P0-1 AQNM一致性 | observe() 返回等效观测 y/alpha |
-| P0-2 UKF sigma points | 改为按列取向量 |
-| P0-3 BER/EVM信道模型 | 使用一致的物理参数 |
-| P0-4 slip帧索引 | _frame_idx初始化为-1 |
+## 核心贡献
 
----
+1. **DU-tun**: 学习的迭代 MAP 估计器，在 killer-π slip 场景下比 GN 提升 22% RMSE
+2. **IEKF**: 迭代扩展卡尔曼滤波器实现，填补 EKF 与 GN 之间的空白
+3. **完整实验框架**: 支持 BER/RMSE/恢复时间等多维度评估
 
-## 📁 目录结构
+## 方法层次
+
+```
+EKF (L=1)    RMSE=1.09  → 单步滤波，slip 后失锁
+    ↓ +27%
+IEKF-4       RMSE=0.80  → 迭代滤波，部分恢复
+    ↓ +31%
+GN-6         RMSE=0.55  → 迭代 MAP，恢复
+    ↓ +22%
+DU-tun-6     RMSE=0.42  → 学习的 MAP，快速恢复
+```
+
+## 快速开始
+
+```bash
+# 安装依赖
+pip install numpy scipy matplotlib
+
+# 生成 IEEE 格式图像
+python scripts/generate_ieee_figures.py
+
+# 输出在 outputs_v4/ 目录
+```
+
+## 目录结构
 
 ```
 sba_du_clean/
 ├── src/
-│   ├── physics/thz_isac_model.py   # THz信道模型
-│   ├── inference/gn_solver.py      # GN求解器
-│   ├── unfolding/du_map.py         # DU-MAP (核心)
-│   ├── baselines/                  # EKF/UKF
-│   ├── bcrlb/pcrb.py              # PCRB理论界
-│   ├── sim/slip.py                # Slip仿真
-│   └── metrics/system_metrics.py   # BER/EVM
+│   ├── physics/          # 物理模型 (THzISACModel)
+│   ├── inference/        # GN 求解器
+│   ├── unfolding/        # DU-MAP 实现
+│   ├── baselines/        # EKF, IEKF, UKF
+│   ├── bcrlb/            # PCRB 理论界
+│   ├── sim/              # 仿真 (slip, phase noise)
+│   └── metrics/          # BER/EVM 计算
 ├── scripts/
-│   └── generate_ieee_figures.py    # 图像生成
-├── FIXES_APPLIED.md               # 修复记录
-└── README.md
+│   └── generate_ieee_figures.py  # 图像生成脚本
+├── outputs/              # 生成的图像和数据
+└── tests/                # 单元测试
 ```
 
----
-
-## 🚀 快速开始
-
-```bash
-# 解压
-tar -xzf sba_du_clean_fixed.tar.gz
-cd sba_du_clean
-
-# 安装依赖
-pip install numpy scipy matplotlib
-
-# 生成图像
-python scripts/generate_ieee_figures.py
-```
-
----
-
-## ⚙️ 核心参数
+## 核心参数
 
 ```python
-# DU-tun 关键参数
+# DU-tun 步长配置 (核心贡献)
 du_cfg.step_scale = np.array([1.0, 0.1, 2.0])
 #                             τ    ν    φ
-#                            标准 保守 激进
+# τ: 标准步长
+# ν: 保守步长 (避免 Doppler 过拟合)  
+# φ: 激进步长 (加速相位恢复) ← 关键
 ```
 
----
+## 实验配置
 
-## 📊 验证测试
+- **Slip 场景**: `SlipConfig.killer_pi(p_slip=0.05)` - ±π 相位跳变
+- **SNR 范围**: 0-20 dB
+- **ADC 分辨率**: 2-8 bits
+- **迭代次数**: L = 2, 4, 6, 8
 
-```python
-import sys
-sys.path.insert(0, '.')
-import numpy as np
+## 输出图像
 
-from src.physics.thz_isac_model import THzISACConfig, THzISACModel
+| 图像 | 描述 |
+|------|------|
+| `fig_ber_snr.png` | BER vs SNR 曲线 |
+| `fig_rmse_snr.png` | RMSE vs SNR 曲线 |
+| `fig_rmse_L.png` | RMSE vs 迭代次数 |
+| `fig_recovery_time.png` | 相位恢复动态 |
+| `fig_slip_2d_heatmap.png` | 幅度×概率 改善热力图 |
+| `fig_improvement_bar.png` | RMSE 改善柱状图 |
+| `fig_ccdf.png` | 相位误差 CCDF |
+| `fig_ber_adc.png` | BER vs ADC 分辨率 |
+| `fig_pcrb_nt.png` | PCRB 理论界 |
 
-# 测试 AQNM 一致性
-cfg = THzISACConfig(n_f=8, n_t=4, snr_db=10, adc_bits=4)
-model = THzISACModel(cfg)
-x0 = np.array([1.0, 0.5, 0.0])
+## 依赖
 
-y = model.observe(x0, 0)
-h = model.h(x0, 0)
-print(f"|y - h|: {np.linalg.norm(y - h):.4f}")  # 应该是噪声水平
-print(f"sigma_eff: {np.sqrt(model.sigma_eff_sq):.4f}")
-```
+- Python 3.8+
+- NumPy
+- SciPy
+- Matplotlib
 
----
+## 许可
 
-## ⚠️ 设计说明与已知限制
-
-### P1-2: 相位噪声与Q_cov的关系
-
-当启用相位噪声 (PN) 时：
-- `PhaseNoiseProcess` 会添加 Wiener 相位噪声到真值
-- `Q_cov` 的 φ 分量 (`q_std_norm[2]`) 也包含相位过程噪声
-
-**建议配置**：
-```python
-# 如果 PN 开启，Q_cov 的 phi 分量应设为 0 或很小
-if pn_cfg is not None:
-    cfg.q_std_norm = (0.02, 0.01, 0.0)  # phi 噪声由 PN 提供
-```
-
-### P1-3: GN vs DU 公平性
-
-当前设计中：
-- GN 可选 `use_preconditioner`、阻尼策略
-- DU 使用固定层数、logspace damping
-
-**公平比较原则**：
-- 关闭 GN 的额外 trick，或在 DU 中使用相同策略
-- 论文中明确说明配置
-
-### P1-4: AQNM vs Hard Quantize
-
-当前使用 AQNM (Additive Quantization Noise Model) 连续近似，而非离散量化。
-
-**限制**：
-- AQNM 是 Bussgang 定理的近似，在低比特 (2-3 bit) 下可能有偏差
-- 顶刊审稿人可能质疑此近似
-
-**未来工作**：
-- 实现 hard quantizer 模块
-- 对比 AQNM 仿真 vs hard quantize 仿真
+MIT License

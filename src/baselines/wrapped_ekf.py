@@ -22,6 +22,155 @@ def wrap_to_pi(x: float) -> float:
     return float((x + np.pi) % (2 * np.pi) - np.pi)
 
 
+# =============================================================================
+# IEKF (Iterated Extended Kalman Filter)
+# =============================================================================
+
+@dataclass
+class IEKFConfig:
+    """
+    Configuration for Iterated Extended Kalman Filter.
+    
+    IEKF iterates the measurement update L times per frame,
+    re-linearizing around the updated estimate each time.
+    This bridges EKF (L=1) and GN (pure optimization).
+    """
+    n_iters: int = 4  # Number of iterations per measurement update
+    wrap_phase: bool = True
+    phase_idx: int = 2
+    convergence_tol: float = 1e-6  # Stop early if converged
+
+
+class IteratedEKF:
+    """
+    Iterated Extended Kalman Filter.
+    
+    Key insight: IEKF iterates the measurement update, re-linearizing
+    at each iteration. This is equivalent to Gauss-Newton on the MAP
+    problem, but maintains the Kalman filter structure.
+    
+    Comparison:
+    - EKF: L=1 iteration → single linearization → fails at slip
+    - IEKF: L>1 iterations → re-linearization → partial recovery
+    - GN: Pure optimization → full recovery but no filter structure
+    
+    Reference: Bell & Cathey, "The Iterated Kalman Filter Update 
+    as a Gauss-Newton Method", IEEE TAC, 1993.
+    """
+    
+    def __init__(self, cfg: IEKFConfig = None):
+        self.cfg = cfg if cfg is not None else IEKFConfig()
+    
+    def run_sequence(
+        self,
+        model,  # THzISACModel
+        y_seq: List[np.ndarray],
+        x0: np.ndarray,
+        P0: np.ndarray,
+    ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
+        """
+        Run IEKF over observation sequence.
+        
+        Returns:
+            x_hat_seq: List of state estimates
+            info: Dictionary with diagnostics
+        """
+        x = x0.copy()
+        P = P0.copy()
+        
+        F = model.F_jacobian()
+        Q = model.Q_cov()
+        
+        x_hat_seq = []
+        n_iters_used = []
+        
+        for k, y in enumerate(y_seq):
+            # === PREDICTION ===
+            x_pred = model.transition(x)
+            if self.cfg.wrap_phase:
+                x_pred = wrap_state(x_pred, self.cfg.phase_idx)
+            P_pred = F @ P @ F.T + Q
+            
+            # === ITERATED UPDATE ===
+            # Initialize at predicted state
+            x_iter = x_pred.copy()
+            
+            for i in range(self.cfg.n_iters):
+                # Linearize at current iterate
+                h_iter = model.h(x_iter, k)
+                H = model.jacobian(x_iter, k)
+                
+                # Real-stacked representation
+                r = y - h_iter
+                r_real = np.concatenate([r.real, r.imag])
+                H_real = np.concatenate([H.real, H.imag])
+                
+                R = (model.sigma_eff_sq / 2.0) * np.eye(len(r_real))
+                
+                # Innovation covariance
+                S = H_real @ P_pred @ H_real.T + R
+                
+                try:
+                    S_inv = np.linalg.inv(S)
+                except np.linalg.LinAlgError:
+                    S_inv = np.linalg.pinv(S)
+                
+                # Kalman gain
+                K = P_pred @ H_real.T @ S_inv
+                
+                # IEKF update: use (x_pred - x_iter) correction term
+                # This is the key difference from standard EKF
+                dx_pred = x_pred - x_iter
+                if self.cfg.wrap_phase:
+                    dx_pred[self.cfg.phase_idx] = wrap_to_pi(dx_pred[self.cfg.phase_idx])
+                
+                innovation = r_real + H_real @ dx_pred
+                x_new = x_pred + K @ innovation
+                
+                if self.cfg.wrap_phase:
+                    x_new = wrap_state(x_new, self.cfg.phase_idx)
+                
+                # Check convergence
+                dx = x_new - x_iter
+                if self.cfg.wrap_phase:
+                    dx[self.cfg.phase_idx] = wrap_to_pi(dx[self.cfg.phase_idx])
+                
+                if np.linalg.norm(dx) < self.cfg.convergence_tol:
+                    x_iter = x_new
+                    n_iters_used.append(i + 1)
+                    break
+                
+                x_iter = x_new
+            else:
+                n_iters_used.append(self.cfg.n_iters)
+            
+            # Final covariance update (at final iterate)
+            H_final = model.jacobian(x_iter, k)
+            H_real_final = np.concatenate([H_final.real, H_final.imag])
+            S_final = H_real_final @ P_pred @ H_real_final.T + R
+            try:
+                S_inv_final = np.linalg.inv(S_final)
+            except:
+                S_inv_final = np.linalg.pinv(S_final)
+            K_final = P_pred @ H_real_final.T @ S_inv_final
+            P = (np.eye(len(x)) - K_final @ H_real_final) @ P_pred
+            
+            x = x_iter
+            x_hat_seq.append(x.copy())
+        
+        info = {
+            'n_iters_used': n_iters_used,
+            'avg_iters': np.mean(n_iters_used),
+        }
+        
+        return x_hat_seq, info
+
+
+def create_iekf(n_iters: int = 4) -> IteratedEKF:
+    """Factory function for IEKF."""
+    return IteratedEKF(IEKFConfig(n_iters=n_iters))
+
+
 def wrap_state(x: np.ndarray, phase_idx: int = 2) -> np.ndarray:
     """Wrap phase component of state vector."""
     y = x.copy()

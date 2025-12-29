@@ -23,7 +23,13 @@ import numpy as np
 
 @dataclass
 class SlipConfig:
-    """Configuration for phase slip process."""
+    """
+    Configuration for phase slip process.
+    
+    IMPORTANT: Use factory methods for standardized scenarios (顶刊可复现):
+    - killer_pi(): ±π slips only (S2 core scenario, DU advantage)
+    - mixed_half_pi(): ±π/2 slips (small slips, GN sufficient)
+    """
     
     # Slip probability per frame
     p_slip: float = 0.02
@@ -31,7 +37,8 @@ class SlipConfig:
     # Mode: "discrete" | "gaussian" | "burst"
     mode: str = "discrete"
     
-    # Discrete slip values (radians)
+    # Discrete slip values (radians) - DEFAULT includes ±2π which wraps to 0!
+    # For publications, use factory methods instead
     values: Tuple[float, ...] = (
         -2*np.pi, -np.pi, -np.pi/2, 
         np.pi/2, np.pi, 2*np.pi
@@ -52,6 +59,62 @@ class SlipConfig:
                 "values and probs must have same length"
             assert abs(sum(self.probs) - 1.0) < 1e-6, \
                 "probs must sum to 1"
+    
+    @staticmethod
+    def killer_pi(p_slip: float = 0.05) -> 'SlipConfig':
+        """
+        S2 Core Scenario: ±π phase slips (maximum non-equivalent jump).
+        
+        This is the "killer slip" scenario where DU-tun shows clear advantage:
+        - ±π is the maximum phase jump that doesn't wrap to 0 (unlike ±2π)
+        - GN struggles to converge with standard step size
+        - DU's aggressive φ_scale=2.0 enables faster recovery
+        
+        顶刊标准配置 - 所有 S2 图使用此定义！
+        
+        Args:
+            p_slip: Per-frame slip probability (default 0.05 = 5%)
+            
+        Returns:
+            SlipConfig for ±π discrete slips
+        """
+        return SlipConfig(
+            mode="discrete",
+            p_slip=p_slip,
+            values=(-np.pi, np.pi),
+            probs=(0.5, 0.5),
+        )
+    
+    @staticmethod
+    def mixed_half_pi(p_slip: float = 0.05) -> 'SlipConfig':
+        """
+        Small slip scenario: ±π/2 phase slips.
+        
+        This is where GN already performs well, DU-tun may overshoot.
+        Used to demonstrate DU-tun's domain-specificity (not universal).
+        
+        Args:
+            p_slip: Per-frame slip probability
+            
+        Returns:
+            SlipConfig for ±π/2 discrete slips
+        """
+        return SlipConfig(
+            mode="discrete",
+            p_slip=p_slip,
+            values=(-np.pi/2, np.pi/2),
+            probs=(0.5, 0.5),
+        )
+    
+    @staticmethod
+    def no_slip() -> 'SlipConfig':
+        """No slip scenario for baseline/PCRB comparison."""
+        return SlipConfig(
+            mode="discrete",
+            p_slip=0.0,
+            values=(0.0,),
+            probs=(1.0,),
+        )
 
 
 class PhaseSlipProcess:
