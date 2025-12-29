@@ -1013,7 +1013,7 @@ def fig_recovery_time():
                 x_curr[2] += np.pi  # 注入 π slip
 
             x_curr = model.transition(x_curr)
-            y = model.sample(x_curr, k)
+            y = model.observe(x_curr, k)
             y_seq.append(y)
             x_true.append(x_curr.copy())
         
