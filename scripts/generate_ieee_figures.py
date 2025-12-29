@@ -1011,7 +1011,7 @@ def fig_recovery_time():
             if k == slip_frame:
                 x_curr = x_curr.copy()
                 x_curr[2] += np.pi  # 注入 π slip
-
+            
             x_curr = model.transition(x_curr)
             y = model.observe(x_curr, k)
             y_seq.append(y)

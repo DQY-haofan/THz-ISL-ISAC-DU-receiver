@@ -67,7 +67,9 @@ class PhaseSlipProcess:
         self.rng = rng if rng is not None else np.random.default_rng()
         self._burst_remaining = 0
         self._slip_history: List[Tuple[int, float]] = []
-        self._frame_idx = 0
+        # Initialize to -1 so first sample() call gives frame_idx=0
+        # This aligns with generate_episode_with_impairments() which uses k=0,1,2,...
+        self._frame_idx = -1
     
     def reset(self, seed: Optional[int] = None) -> None:
         """Reset process state."""
@@ -75,7 +77,7 @@ class PhaseSlipProcess:
             self.rng = np.random.default_rng(seed)
         self._burst_remaining = 0
         self._slip_history = []
-        self._frame_idx = 0
+        self._frame_idx = -1  # Reset to -1 for consistency
     
     def sample(self) -> float:
         """
@@ -260,8 +262,26 @@ def generate_episode_with_impairments(
         x_true_seq: True states
         slip_frames: Frames where slip occurred
         pn_increments: Per-frame PN increments
+        
+    Note (P1-2):
+        If both pn_cfg.enabled=True AND model.cfg.q_std_norm[2] > 0, the phase
+        will have double random walk (PN process + Q_cov phase noise).
+        Recommendation: When using PN process, set q_std_norm[2] = 0 in model config.
     """
+    import warnings
+    
     rng = np.random.default_rng(seed)
+    
+    # P1-2: Check for potential phase noise double counting
+    if pn_cfg is not None and pn_cfg.enabled and pn_cfg.sigma_phi > 0:
+        q_phi = model.cfg.q_std_norm[2] if hasattr(model.cfg, 'q_std_norm') else 0
+        if q_phi > 0.01:  # Non-trivial Q_cov phase noise
+            warnings.warn(
+                f"P1-2: Both PN process (sigma_phi={pn_cfg.sigma_phi}) and Q_cov phase noise "
+                f"(q_std_norm[2]={q_phi}) are enabled. This may cause double counting of "
+                f"phase random walk. Consider setting q_std_norm[2]=0 when using PN process.",
+                UserWarning
+            )
     
     # Initialize processes
     slip_process = None

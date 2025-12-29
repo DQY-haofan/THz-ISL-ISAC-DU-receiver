@@ -11,12 +11,18 @@ Implementation:
 - Single-carrier QPSK
 - 64 data symbols per frame
 - Compensation using (τ̂, ν̂, φ̂) estimates
+
+P0-3 Fix: All parameters now read from model.cfg to ensure consistency
+with thz_isac_model.h() observation model.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, TYPE_CHECKING
 import numpy as np
+
+if TYPE_CHECKING:
+    from src.physics.thz_isac_model import THzISACConfig
 
 
 @dataclass
@@ -29,15 +35,29 @@ class SystemMetricsConfig:
     # Symbols per frame
     n_data_symbols: int = 64
     
-    # Symbol period (normalized)
-    T_sym: float = 1.0
+    # Symbol period (derived from frame duration / n_data_symbols)
+    T_sym: float = 1e-6  # Default, will be overwritten from model.cfg
     
-    # Physical parameters for unit conversion
+    # Physical parameters - defaults, should be read from model.cfg
     c: float = 3e8  # Speed of light (m/s)
     f_c: float = 300e9  # Carrier frequency (Hz) - THz band
+    delay_scale: float = 1e-9  # Delay normalization scale (s)
+    doppler_scale: float = 1e3  # Doppler normalization scale (Hz)
+    frame_duration: float = 100e-6  # Frame duration (s)
     
     # ISAC mode: 'one_way' or 'two_way'
     isac_mode: str = 'one_way'
+    
+    @classmethod
+    def from_model_cfg(cls, model_cfg: 'THzISACConfig') -> 'SystemMetricsConfig':
+        """Create SystemMetricsConfig from THzISACConfig for consistency."""
+        return cls(
+            f_c=model_cfg.carrier_freq_hz,
+            delay_scale=model_cfg.delay_scale,
+            doppler_scale=model_cfg.doppler_scale,
+            frame_duration=model_cfg.frame_duration_s,
+            T_sym=model_cfg.frame_duration_s / 64,  # Assume 64 symbols per frame
+        )
 
 
 def generate_qpsk_symbols(n_symbols: int, rng: np.random.Generator = None) -> np.ndarray:
@@ -55,24 +75,43 @@ def apply_channel_distortion(
     symbols: np.ndarray,
     tau: float,  # Normalized delay
     nu: float,   # Normalized Doppler
-    phi: float,  # Phase (rad)
+    phi: float,  # Phase (rad, NOT normalized)
     snr_db: float,
     rng: np.random.Generator = None,
+    cfg: SystemMetricsConfig = None,
 ) -> np.ndarray:
     """
     Apply channel distortion to transmitted symbols.
     
-    Model: y_k = s_k * exp(j * (phi + 2*pi*nu*k*T_sym)) + noise
-    Note: Delay mainly affects timing, simplified here
+    Model consistent with thz_isac_model.h():
+    y_k = s_k * exp(j * (phi + 2*pi*nu_phys*k*T_sym)) + noise
+    
+    NOTE: For data symbols, we use single-carrier model with time-varying phase.
+    Delay effect is timing offset (omitted for simplicity in BER/EVM eval).
+    
+    Args:
+        symbols: TX symbols
+        tau: Normalized delay (unused in single-carrier, affects timing)
+        nu: Normalized Doppler
+        phi: Phase in radians (already denormalized, phase_scale=1.0)
+        snr_db: SNR in dB
+        rng: Random generator
+        cfg: SystemMetricsConfig (for physical parameters)
     """
     if rng is None:
         rng = np.random.default_rng()
+    if cfg is None:
+        cfg = SystemMetricsConfig()
     
     n = len(symbols)
     k = np.arange(n)
     
-    # Phase rotation due to Doppler and initial phase
-    phase = phi + 2 * np.pi * nu * k * 0.01  # T_sym normalized
+    # Convert normalized Doppler to physical: nu_phys = nu * doppler_scale (Hz)
+    nu_phys = nu * cfg.doppler_scale
+    
+    # Phase rotation: phi + 2*pi*nu_phys*k*T_sym
+    # This is consistent with thz_isac_model.h() which uses 2*pi*nu*t
+    phase = phi + 2.0 * np.pi * nu_phys * k * cfg.T_sym
     
     # Apply channel
     y = symbols * np.exp(1j * phase)
@@ -91,17 +130,31 @@ def compensate_channel(
     tau_hat: float,
     nu_hat: float,
     phi_hat: float,
+    cfg: SystemMetricsConfig = None,
 ) -> np.ndarray:
     """
     Compensate channel using estimated parameters.
     
-    De-rotation: y_comp = y * exp(-j * (phi_hat + 2*pi*nu_hat*k*T_sym))
+    De-rotation: y_comp = y * exp(-j * (phi_hat + 2*pi*nu_hat_phys*k*T_sym))
+    
+    Args:
+        y: Received symbols
+        tau_hat: Estimated normalized delay (unused)
+        nu_hat: Estimated normalized Doppler
+        phi_hat: Estimated phase (rad)
+        cfg: SystemMetricsConfig (for physical parameters)
     """
+    if cfg is None:
+        cfg = SystemMetricsConfig()
+    
     n = len(y)
     k = np.arange(n)
     
-    # Estimated phase
-    phase_hat = phi_hat + 2 * np.pi * nu_hat * k * 0.01
+    # Convert normalized Doppler to physical
+    nu_hat_phys = nu_hat * cfg.doppler_scale
+    
+    # Estimated phase trajectory
+    phase_hat = phi_hat + 2.0 * np.pi * nu_hat_phys * k * cfg.T_sym
     
     # De-rotate
     y_comp = y * np.exp(-1j * phase_hat)
@@ -168,29 +221,22 @@ def estimate_to_physical(
     Args:
         tau_norm: Normalized delay
         nu_norm: Normalized Doppler
-        cfg: System configuration
+        cfg: System configuration (with delay_scale, doppler_scale from model.cfg)
         
     Returns:
         range_m: Range in meters
         velocity_ms: Velocity in m/s
     """
-    # Assume tau_norm is normalized by some scale (e.g., symbol period)
-    # For THz-ISAC, typical normalization: tau_norm * T_frame = actual delay
-    # Range: r = c * tau / 2 (two-way) or c * tau (one-way)
-    
-    # You need to define the denormalization based on your model
-    # Example: if tau_norm is in units where tau_norm=1 means T_frame=100us
-    T_frame = 100e-6  # 100 us
-    tau_actual = tau_norm * T_frame  # seconds
+    # Denormalize using scales from config
+    tau_actual = tau_norm * cfg.delay_scale  # seconds
     
     if cfg.isac_mode == 'one_way':
         range_m = cfg.c * tau_actual
     else:  # two_way
         range_m = cfg.c * tau_actual / 2
     
-    # Doppler: nu_norm is normalized frequency
-    # v = c * nu / f_c (one-way) or c * nu / (2*f_c) (two-way)
-    nu_actual = nu_norm / T_frame  # Hz
+    # Doppler: nu_norm * doppler_scale = physical frequency (Hz)
+    nu_actual = nu_norm * cfg.doppler_scale  # Hz
     
     if cfg.isac_mode == 'one_way':
         velocity_ms = cfg.c * nu_actual / cfg.f_c
@@ -211,23 +257,21 @@ def rmse_to_physical(
     Args:
         rmse_tau: RMSE of normalized delay
         rmse_nu: RMSE of normalized Doppler
-        cfg: System configuration
+        cfg: System configuration (with delay_scale, doppler_scale from model.cfg)
         
     Returns:
         range_error_m: Range error in meters
         velocity_error_ms: Velocity error in m/s
     """
-    T_frame = 100e-6  # 100 us (must match your model)
-    
     # Range error
-    tau_error_s = rmse_tau * T_frame
+    tau_error_s = rmse_tau * cfg.delay_scale
     if cfg.isac_mode == 'one_way':
         range_error_m = cfg.c * tau_error_s
     else:
         range_error_m = cfg.c * tau_error_s / 2
     
     # Velocity error
-    nu_error_hz = rmse_nu / T_frame
+    nu_error_hz = rmse_nu * cfg.doppler_scale
     if cfg.isac_mode == 'one_way':
         velocity_error_ms = cfg.c * nu_error_hz / cfg.f_c
     else:
@@ -273,16 +317,17 @@ class SystemMetricsEvaluator:
         # Generate transmitted symbols
         s_tx, bits_tx = generate_qpsk_symbols(self.cfg.n_data_symbols, self.rng)
         
-        # Apply true channel
+        # Apply true channel (using cfg for physical parameters)
         y = apply_channel_distortion(
             s_tx, 
             x_true[0], x_true[1], x_true[2],
             snr_db, 
-            self.rng
+            self.rng,
+            self.cfg,
         )
         
-        # Compensate using estimates
-        y_comp = compensate_channel(y, x_hat[0], x_hat[1], x_hat[2])
+        # Compensate using estimates (using cfg for physical parameters)
+        y_comp = compensate_channel(y, x_hat[0], x_hat[1], x_hat[2], self.cfg)
         
         # Compute metrics
         ber = compute_ber_qpsk(y_comp, bits_tx)
@@ -385,9 +430,27 @@ def quick_ber_evm(
     x_hat_seq: List[np.ndarray],
     snr_db: float,
     seed: int = 42,
+    model_cfg: 'THzISACConfig' = None,
 ) -> Tuple[float, float]:
-    """Quick BER/EVM evaluation for a sequence."""
-    evaluator = SystemMetricsEvaluator()
+    """Quick BER/EVM evaluation for a sequence.
+    
+    Args:
+        x_true_seq: True state sequence
+        x_hat_seq: Estimated state sequence
+        snr_db: SNR in dB
+        seed: Random seed
+        model_cfg: THzISACConfig for physical parameters (optional, uses defaults if None)
+        
+    Returns:
+        avg_ber: Average BER
+        avg_evm: Average EVM
+    """
+    if model_cfg is not None:
+        cfg = SystemMetricsConfig.from_model_cfg(model_cfg)
+    else:
+        cfg = SystemMetricsConfig()
+    
+    evaluator = SystemMetricsEvaluator(cfg)
     evaluator.set_seed(seed)
     _, _, avg_ber, avg_evm = evaluator.evaluate_sequence(x_true_seq, x_hat_seq, snr_db)
     return avg_ber, avg_evm

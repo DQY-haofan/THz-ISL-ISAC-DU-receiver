@@ -23,7 +23,18 @@ from src.inference.energy import build_map_terms, gn_grad_hess, energy_map
 
 @dataclass
 class GNSolverConfig:
-    """Configuration for Gauss-Newton MAP solver."""
+    """Configuration for Gauss-Newton MAP solver.
+    
+    P1-3 Fair Comparison Notes:
+        For fair comparison with DU-MAP, set:
+        - use_preconditioner = False (DU doesn't use preconditioner)
+        - step_scale = [1.0, 1.0, 1.0] (to match DU-default)
+        - damping = average of DU damping schedule
+        
+        The "DU-tun" configuration uses:
+        - step_scale = [1.0, 0.1, 2.0]
+        which is the key difference from GN.
+    """
     
     # Iteration control
     max_iters: int = 8
@@ -45,6 +56,7 @@ class GNSolverConfig:
     )
     
     # Preconditioning (information-geometric)
+    # P1-3: Set to False for fair comparison with DU-MAP
     use_preconditioner: bool = True
     precond_eps: float = 1e-6
 
@@ -254,3 +266,25 @@ class GaussNewtonMAP:
         }
         
         return x_hat_seq, seq_info
+
+
+def create_gn_config_fair(max_iters: int = 6) -> GNSolverConfig:
+    """
+    Create GN config for fair comparison with DU-MAP.
+    
+    This disables GN-specific tricks (preconditioner, update mask, custom step_scale)
+    to ensure comparison measures only the algorithmic difference.
+    
+    Args:
+        max_iters: Number of iterations (should match DU n_layers)
+        
+    Returns:
+        GNSolverConfig with settings aligned to DU-default
+    """
+    return GNSolverConfig(
+        max_iters=max_iters,
+        damping=1e-2,  # Fixed damping (DU uses per-layer but this is average)
+        step_scale=np.array([1.0, 1.0, 1.0]),  # Match DU-default
+        update_mask_every=np.array([1, 1, 1]),  # Update all variables every iter
+        use_preconditioner=False,  # DU doesn't use preconditioner
+    )

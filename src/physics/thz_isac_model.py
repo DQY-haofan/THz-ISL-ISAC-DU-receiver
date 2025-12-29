@@ -365,11 +365,15 @@ class THzISACModel:
         y = h + n
         
         # AQNM quantization
+        # y_q = alpha*y + q, then return equivalent observation ỹ = y_q/alpha
+        # This makes sigma_eff_sq = awgn_var + quant_var/alpha^2 consistent
         if self.cfg.apply_quantization and self.cfg.adc_bits < 12:
             q = np.sqrt(self.quant_var / 2) * (
                 rng.standard_normal(self.m) + 1j * rng.standard_normal(self.m)
             )
-            y = self.alpha * y + q
+            y_q = self.alpha * y + q
+            # Return equivalent observation (divide by alpha)
+            y = y_q / self.alpha
         
         return y
     

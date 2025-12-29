@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 import numpy as np
+from scipy.stats import chi2
 
 
 def wrap_to_pi(x: float) -> float:
@@ -38,7 +39,11 @@ class EKFConfig:
     
     # Robustification
     use_gating: bool = False
-    nis_threshold: float = 9.21  # chi2(3, 0.99) for 3D state
+    # P1-1 Fix: NIS threshold should depend on observation dimension (2*m), not state dim
+    # Default uses chi2(0.99) which will be computed dynamically based on obs dim
+    # Set to None for dynamic computation, or override with fixed value
+    nis_threshold: float = None  # Will be computed as chi2.ppf(0.99, df=obs_dim)
+    nis_confidence: float = 0.99  # Confidence level for chi2 threshold
     r_inflation: float = 10.0   # R multiplier when NIS exceeds threshold
     
     # Reject update entirely if NIS too high
@@ -214,7 +219,20 @@ class RobustEKF:
             R = R_base.copy()
             
             if self.cfg.use_gating:
-                if nis > self.cfg.reject_threshold:
+                # P1-1 Fix: Compute NIS threshold based on observation dimension
+                obs_dim = len(r_real)  # This is 2*m (real representation of complex obs)
+                
+                if self.cfg.nis_threshold is None:
+                    # Dynamic threshold based on chi2 distribution
+                    nis_thresh = chi2.ppf(self.cfg.nis_confidence, df=obs_dim)
+                else:
+                    # Use fixed threshold (user override)
+                    nis_thresh = self.cfg.nis_threshold
+                
+                # Reject threshold is typically higher (e.g., 0.999 confidence)
+                reject_thresh = self.cfg.reject_threshold if self.cfg.reject_threshold else chi2.ppf(0.999, df=obs_dim)
+                
+                if nis > reject_thresh:
                     # Extreme outlier - reject update entirely
                     rejected = True
                     rejected_seq.append(True)
@@ -228,7 +246,7 @@ class RobustEKF:
                     x_hat_seq.append(x.copy())
                     continue
                     
-                elif nis > self.cfg.nis_threshold:
+                elif nis > nis_thresh:
                     # Outlier - inflate R
                     gated = True
                     R = R_base * self.cfg.r_inflation

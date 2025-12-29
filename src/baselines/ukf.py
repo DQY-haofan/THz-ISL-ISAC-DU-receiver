@@ -78,12 +78,13 @@ class UnscentedKalmanFilter:
             sqrt_P = eigvecs @ np.diag(np.sqrt((n + lam) * eigvals)) @ eigvecs.T
         
         # Sigma points: [x, x + sqrt_P, x - sqrt_P]
+        # NOTE: sqrt_P[:, i] is the i-th column (correct for Cholesky lower triangular)
         sigma_points = np.zeros((2*n + 1, n))
         sigma_points[0] = x
         
         for i in range(n):
-            sigma_points[i + 1] = x + sqrt_P[i]
-            sigma_points[n + i + 1] = x - sqrt_P[i]
+            sigma_points[i + 1] = x + sqrt_P[:, i]
+            sigma_points[n + i + 1] = x - sqrt_P[:, i]
         
         return sigma_points
     
