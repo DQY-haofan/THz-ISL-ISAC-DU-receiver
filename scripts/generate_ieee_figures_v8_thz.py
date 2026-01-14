@@ -119,11 +119,16 @@ def save_figure(fig, name):
 # ============================================================================
 
 def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
-                      bandwidth_hz=100e6, frame_duration_s=100e-6):
+                      bandwidth_hz=100e6, frame_duration_s=100e-6,
+                      pn_linewidth_hz=100.0):
     """
-    创建THz-ISL配置，启用Doppler squint效应
+    创建THz-ISL配置 - V3完整物理模型版
 
-    这是v8的核心修改：所有实验统一使用此函数创建配置
+    TWC主文配置：
+    - P0: 连续PN Wiener模型（linewidth参数化）✅
+    - P0: Doppler squint ✅
+    - P1: Beam squint（pilot subband可忽略，默认关闭）
+    - P2: Pointing jitter（stress-test用，默认关闭）
     """
     return THzISACConfig(
         n_f=n_f,
@@ -132,9 +137,16 @@ def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
         adc_bits=adc_bits,
         bandwidth_hz=bandwidth_hz,
         frame_duration_s=frame_duration_s,
-        # ★★★ THz效应开关 ★★★
-        enable_doppler_squint=True,  # 启用Doppler squint
-        enable_beam_squint_proxy=False,  # Beam squint proxy（可选）
+        # ★★★ V3 THz物理效应 ★★★
+        # P0: 连续PN（主文启用）
+        enable_continuous_pn=True,
+        pn_linewidth_hz=pn_linewidth_hz,
+        # P0: Doppler squint（主文启用）
+        enable_doppler_squint=True,
+        # P1: Beam squint（pilot subband可忽略）
+        enable_beam_squint=False,
+        # P2: Pointing jitter（stress-test时启用）
+        enable_pointing_jitter=False,
     )
 
 
@@ -399,7 +411,7 @@ def fig_rmse_vs_snr():
 
 
 def fig_rmse_vs_L():
-    """RMSE vs 迭代层数 L"""
+    """RMSE vs 迭代层数 L - 包含EKF和IEKF基线"""
     print("\nFig: RMSE vs L")
 
     L_list = [1, 2, 4, 6, 8, 10]
@@ -411,6 +423,11 @@ def fig_rmse_vs_L():
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
     model = THzISACModel(cfg)
 
+    # EKF基线（L=1，单次）
+    ekf_results = []
+    # IEKF结果（不同迭代次数）
+    iekf_results = {L: [] for L in L_list}
+    # GN和DU结果
     gn_results = {L: [] for L in L_list}
     du_results = {L: [] for L in L_list}
 
@@ -420,11 +437,24 @@ def fig_rmse_vs_L():
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
 
+            # EKF (只在L=1时计算一次)
+            if L == 1:
+                x_ekf = run_estimator('EKF', model, y_seq, x0, P0)
+                rmse_ekf, _ = compute_rmse(x_ekf, x_true)
+                ekf_results.append(rmse_ekf)
+
+            # IEKF-L
+            x_iekf = run_estimator(f'IEKF-{L}', model, y_seq, x0, P0)
+            rmse_iekf, _ = compute_rmse(x_iekf, x_true)
+            iekf_results[L].append(rmse_iekf)
+
+            # GN-L
             gn = GaussNewtonMAP(GNSolverConfig(max_iters=L))
             x_gn = gn.solve_sequence(model, y_seq, x0, P0)[0]
             rmse_gn, _ = compute_rmse(x_gn, x_true)
             gn_results[L].append(rmse_gn)
 
+            # DU-L
             du_cfg = DUMAPConfig(n_layers=L)
             du_cfg.step_scale = get_du_step_scale()
             du = DUMAP(du_cfg)
@@ -432,6 +462,14 @@ def fig_rmse_vs_L():
             rmse_du, _ = compute_rmse(x_du, x_true)
             du_results[L].append(rmse_du)
 
+        # 记录数据
+        if L == 1:
+            collector.add_performance('rmse_vs_L', 'L', L, 'EKF',
+                                      'RMSE', np.mean(ekf_results), np.std(ekf_results),
+                                      n_seeds, n_frames)
+        collector.add_performance('rmse_vs_L', 'L', L, 'IEKF',
+                                  'RMSE', np.mean(iekf_results[L]), np.std(iekf_results[L]),
+                                  n_seeds, n_frames)
         collector.add_performance('rmse_vs_L', 'L', L, 'GN',
                                   'RMSE', np.mean(gn_results[L]), np.std(gn_results[L]),
                                   n_seeds, n_frames)
@@ -440,16 +478,29 @@ def fig_rmse_vs_L():
                                   n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    gn_means = [np.mean(gn_results[L]) for L in L_list]
-    gn_stds = [np.std(gn_results[L]) for L in L_list]
-    du_means = [np.mean(du_results[L]) for L in L_list]
-    du_stds = [np.std(du_results[L]) for L in L_list]
 
-    ax.errorbar(L_list, gn_means, yerr=gn_stds, color=COLORS['GN-6'],
-                marker='s', label='GN', capsize=3)
-    ax.errorbar(L_list, du_means, yerr=du_stds, color=COLORS['DU-tun-6'],
-                marker='D', label='DU-tun', capsize=3)
+    # EKF基线（水平虚线）
+    ekf_mean = np.mean(ekf_results)
+    ax.axhline(y=ekf_mean, color=COLORS['EKF'], linestyle='--',
+               label='EKF (L=1)', linewidth=1.2, alpha=0.8)
+
+    # IEKF
+    iekf_means = [np.mean(iekf_results[L]) for L in L_list]
+    ax.plot(L_list, iekf_means, marker='^', color=COLORS['IEKF-4'],
+            label='IEKF', linewidth=1.2)
+
+    # GN
+    gn_means = [np.mean(gn_results[L]) for L in L_list]
+    ax.plot(L_list, gn_means, marker='s', color=COLORS['GN-6'],
+            label='GN', linewidth=1.2)
+
+    # DU
+    du_means = [np.mean(du_results[L]) for L in L_list]
+    ax.plot(L_list, du_means, marker='D', color=COLORS['DU-tun-6'],
+            label='DU-tun', linewidth=1.2)
+
     ax.set_xlabel('Number of Layers/Iterations $L$')
     ax.set_ylabel('RMSE')
     ax.legend(loc='upper right')
@@ -536,7 +587,12 @@ def fig_slip_2d_heatmap():
     for i, amp in enumerate(amplitudes):
         for j, p_slip in enumerate(p_slips):
             print(f"  amp={amp}π, p_slip={p_slip}...", end=" ", flush=True)
-            slip_cfg = SlipConfig(amplitude_rad=amp * np.pi, p_slip=p_slip)
+            # 使用values和probs参数指定slip幅度
+            slip_cfg = SlipConfig(
+                p_slip=p_slip,
+                values=(amp * np.pi, -amp * np.pi),
+                probs=(0.5, 0.5)
+            )
 
             ekf_rmse, gn_rmse, du_rmse = [], [], []
             for seed in range(n_seeds):
@@ -632,7 +688,7 @@ def fig_phase_tracking():
 # ============================================================================
 
 def fig_ber_vs_L():
-    """BER vs L"""
+    """BER vs L - 包含EKF和IEKF基线"""
     print("\nFig: BER vs L")
 
     L_list = [1, 2, 4, 6, 8, 10]
@@ -644,6 +700,8 @@ def fig_ber_vs_L():
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
     model = THzISACModel(cfg)
 
+    ekf_results = []
+    iekf_results = {L: [] for L in L_list}
     gn_results = {L: [] for L in L_list}
     du_results = {L: [] for L in L_list}
 
@@ -653,11 +711,24 @@ def fig_ber_vs_L():
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
 
+            # EKF
+            if L == 1:
+                x_ekf = run_estimator('EKF', model, y_seq, x0, P0)
+                ber_ekf, _ = quick_ber_evm(x_true, x_ekf, 10, seed)
+                ekf_results.append(ber_ekf * 100)
+
+            # IEKF-L
+            x_iekf = run_estimator(f'IEKF-{L}', model, y_seq, x0, P0)
+            ber_iekf, _ = quick_ber_evm(x_true, x_iekf, 10, seed)
+            iekf_results[L].append(ber_iekf * 100)
+
+            # GN-L
             gn = GaussNewtonMAP(GNSolverConfig(max_iters=L))
             x_gn = gn.solve_sequence(model, y_seq, x0, P0)[0]
             ber_gn, _ = quick_ber_evm(x_true, x_gn, 10, seed)
             gn_results[L].append(ber_gn * 100)
 
+            # DU-L
             du_cfg = DUMAPConfig(n_layers=L)
             du_cfg.step_scale = get_du_step_scale()
             du = DUMAP(du_cfg)
@@ -665,6 +736,13 @@ def fig_ber_vs_L():
             ber_du, _ = quick_ber_evm(x_true, x_du, 10, seed)
             du_results[L].append(ber_du * 100)
 
+        if L == 1:
+            collector.add_performance('ber_vs_L', 'L', L, 'EKF',
+                                      'BER_pct', np.mean(ekf_results), np.std(ekf_results),
+                                      n_seeds, n_frames)
+        collector.add_performance('ber_vs_L', 'L', L, 'IEKF',
+                                  'BER_pct', np.mean(iekf_results[L]), np.std(iekf_results[L]),
+                                  n_seeds, n_frames)
         collector.add_performance('ber_vs_L', 'L', L, 'GN',
                                   'BER_pct', np.mean(gn_results[L]), np.std(gn_results[L]),
                                   n_seeds, n_frames)
@@ -674,16 +752,32 @@ def fig_ber_vs_L():
         print("done")
 
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
+
+    # EKF基线
+    ekf_mean = np.mean(ekf_results)
+    ax.axhline(y=ekf_mean, color=COLORS['EKF'], linestyle='--',
+               label='EKF (L=1)', linewidth=1.2, alpha=0.8)
+
+    # IEKF
+    iekf_means = [np.mean(iekf_results[L]) for L in L_list]
+    ax.plot(L_list, iekf_means, '^-', color=COLORS['IEKF-4'], label='IEKF')
+
+    # GN
     gn_means = [np.mean(gn_results[L]) for L in L_list]
-    du_means = [np.mean(du_results[L]) for L in L_list]
     ax.plot(L_list, gn_means, 's-', color=COLORS['GN-6'], label='GN')
+
+    # DU
+    du_means = [np.mean(du_results[L]) for L in L_list]
     ax.plot(L_list, du_means, 'D-', color=COLORS['DU-tun-6'], label='DU-tun')
+
     ax.set_xlabel('Number of Layers/Iterations $L$')
     ax.set_ylabel('BER (%)')
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
     ax.set_xticks(L_list)
+    ax.set_yscale('log')
     save_figure(fig, 'fig_ber_vs_L')
+
 
 
 def fig_ber_vs_L_multiSNR():
@@ -741,7 +835,7 @@ def fig_ber_vs_pslip():
     print("\nFig: BER vs p_slip")
 
     p_slip_list = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15]
-    methods = ['EKF', 'GN-6', 'DU-tun-6']
+    methods = ['EKF', 'IEKF-4', 'GN-6', 'DU-tun-6']
 
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
     model = THzISACModel(cfg)
@@ -787,7 +881,7 @@ def fig_ber_vs_adc():
     print("\nFig: BER vs ADC")
 
     adc_list = [2, 3, 4, 5, 6, 8]
-    methods = ['EKF', 'GN-6', 'DU-tun-6']
+    methods = ['EKF', 'IEKF-4', 'GN-6', 'DU-tun-6']
 
     x0 = np.array([1.0, 0.5, 0.0])
     P0 = np.eye(3) * 0.1
@@ -915,9 +1009,9 @@ def fig_sensitivity_phi():
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     means = [np.mean(results[a]) for a in alpha_phi_list]
     stds = [np.std(results[a]) for a in alpha_phi_list]
-    ax.errorbar(alpha_phi_list, means, yerr=stds, marker='D',
-                color=COLORS['DU-tun-6'], capsize=3)
-    ax.axvline(1.5, color='red', linestyle='--', alpha=0.7, label='Default')
+    ax.errorbar(alpha_phi_list, means, yerr=stds, marker='o',
+                color='#E41A1C', capsize=3, linewidth=1.5, markersize=7)
+    ax.axvline(1.5, color='gray', linestyle='--', alpha=0.7, label='Default (1.5)')
     ax.set_xlabel(r'Phase Step Scale $\alpha_\phi$')
     ax.set_ylabel('RMSE')
     ax.legend()
@@ -959,9 +1053,9 @@ def fig_sensitivity_nu():
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     means = [np.mean(results[a]) for a in alpha_nu_list]
     stds = [np.std(results[a]) for a in alpha_nu_list]
-    ax.errorbar(alpha_nu_list, means, yerr=stds, marker='D',
-                color=COLORS['DU-tun-6'], capsize=3)
-    ax.axvline(0.1, color='red', linestyle='--', alpha=0.7, label='Default')
+    ax.errorbar(alpha_nu_list, means, yerr=stds, marker='s',
+                color='#377EB8', capsize=3, linewidth=1.5, markersize=7)
+    ax.axvline(0.1, color='gray', linestyle='--', alpha=0.7, label='Default (0.1)')
     ax.set_xlabel(r'Doppler Step Scale $\alpha_\nu$')
     ax.set_ylabel('RMSE')
     ax.set_xscale('log')
@@ -1004,9 +1098,9 @@ def fig_sensitivity_tau():
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     means = [np.mean(results[a]) for a in alpha_tau_list]
     stds = [np.std(results[a]) for a in alpha_tau_list]
-    ax.errorbar(alpha_tau_list, means, yerr=stds, marker='D',
-                color=COLORS['DU-tun-6'], capsize=3)
-    ax.axvline(1.0, color='red', linestyle='--', alpha=0.7, label='Default')
+    ax.errorbar(alpha_tau_list, means, yerr=stds, marker='^',
+                color='#4DAF4A', capsize=3, linewidth=1.5, markersize=7)
+    ax.axvline(1.0, color='gray', linestyle='--', alpha=0.7, label='Default (1.0)')
     ax.set_xlabel(r'Delay Step Scale $\alpha_\tau$')
     ax.set_ylabel('RMSE')
     ax.set_xscale('log')
@@ -1177,7 +1271,8 @@ def fig_thz_phase_sensitivity():
     fc_list = [10, 60, 100, 300]  # GHz
     p_slip_base = 0.005
 
-    methods = ['EKF', 'GN-6', 'DU-tun-6']
+    methods = ['EKF', 'IEKF-4', 'GN-6', 'DU-tun-6']
+
     results = {fc: {m: [] for m in methods} for fc in fc_list}
 
     x0 = np.array([1.0, 0.5, 0.0])
@@ -1315,11 +1410,13 @@ def fig_thz_doppler_squint():
 
 def main():
     print("=" * 70)
-    print("IEEE 格式图像生成 v8 - THz效应启用版")
+    print("IEEE 格式图像生成 - V3 完整物理模型版")
     print("=" * 70)
     print()
-    print("★ 关键修改：enable_doppler_squint=True")
-    print("★ 所有实验使用统一的THz配置")
+    print("★ V3物理效应：")
+    print("  - P0: 连续PN Wiener模型（linewidth=100Hz）")
+    print("  - P0: Doppler squint")
+    print("  - P1/P2: Beam squint & Pointing jitter（stress-test）")
     print()
     print("=" * 70)
 

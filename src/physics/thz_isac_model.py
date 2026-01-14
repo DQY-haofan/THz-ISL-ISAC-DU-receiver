@@ -1,32 +1,32 @@
-# src/physics/thz_isac_model_v2.py
+#!/usr/bin/env python3
 """
-Unified THz-ISAC Physical Model - V2 (TWC Submission Ready)
+THz-ISAC Physical Model V3 - 完整物理建模版
+============================================
 
-CHANGELOG from v1:
-- P0-FIX: n_t default changed from 2 to 4 (matches paper Table I: 8×4 grid)
-- P0-NEW: Doppler squint switch (enable_doppler_squint)
-- P0-NEW: Beam-squint proxy switch (enable_beam_squint_proxy)
-- P0-NEW: AQNM source clarification in docstring
-- All switches default to False for backward compatibility
+基于专家建议的完整实现：
 
-Per advisor restructure (2025-12-27) + P0.5 fixes + TWC P0 additions:
-- 2D pilot grid: frequency (f_i) x time (t_j) for Doppler observability
-- Fast/slow variable coupling: φ fast (driven by ν), ν slow (AR process)
-- State transition: φ_{k+1} = φ_k + 2π*ν*T_frame + w_φ
-- AQNM quantization with equivalent Gaussian noise
+P0（必须做）：
+- 连续相位噪声 Wiener 模型（linewidth 参数化）
+- Discrete slip 保留
 
-P0.5 CRITICAL FIXES (retained):
-1. Measurement uses INTRA-FRAME time t_j only (not absolute t_abs = kT + t_j)
-   - Cross-frame accumulation is ONLY in state transition
-   - This avoids "double counting" of Doppler information
-2. Phase wrapping utilities for circular manifold handling
+P1（建议做）：
+- 真正的 Beam squint：ULA 阵列的频率-角度耦合增益
+- 不是简单的 g(f) proxy
 
-TWC P0 ADDITIONS:
-3. Doppler squint: ν_eff(f_i) = ν * (1 + f_i/f_c) when enabled
-4. Beam-squint proxy: frequency-selective gain g(f_i) when enabled
-5. n_t=4 default to match paper Table I (8×4 pilot grid)
+P2（可选）：
+- Pointing jitter：帧级增益抖动（作为 mismatch 注入）
 
-This is the SINGLE SOURCE OF TRUTH for all algorithms (EKF, GN, DU, PCRB).
+保留：
+- Doppler squint：ν_eff = ν(1 + f/fc)
+- AQNM 量化模型
+- Two-timescale state-space
+
+所有新效应默认关闭，确保向后兼容。
+
+参考文献：
+- Wiener PN: Petrovic et al., "Effects of Phase Noise on OFDM Systems"
+- Beam squint: 标准 ULA 阵列响应
+- ISL 无大气吸收: ITU "Terahertz Wireless Communications in Space"
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ import numpy as np
 
 
 # =========================================================================
-# Module-level phase wrapping utilities
+# Phase wrapping utilities
 # =========================================================================
 
 def wrap_angle(angle: float) -> float:
@@ -50,99 +50,121 @@ def wrap_angle_array(angles: np.ndarray) -> np.ndarray:
 
 
 def circular_error(phi_hat: float, phi_true: float) -> float:
-    """
-    Compute circular (wrapped) phase error.
-    
-    Returns error in [-π, π], the shortest angular distance.
-    """
+    """Compute circular (wrapped) phase error."""
     return wrap_angle(phi_hat - phi_true)
 
 
 # =========================================================================
-# Configuration
+# Configuration - V3 完整版
 # =========================================================================
 
 @dataclass
 class THzISACConfig:
     """
-    THz-ISAC system configuration.
-    
-    TWC P0 Note: Default values match paper Table I exactly.
+    THz-ISAC V3 配置 - 包含完整物理效应
+
+    新增效应（相比V2）：
+    - 连续PN Wiener模型（linewidth参数化）
+    - 物理Beam squint（ULA阵列模型）
+    - Pointing jitter（帧级增益抖动）
     """
-    
-    # Pilot grid (frequency x time) - FIXED: n_t=4 to match paper Table I
-    n_f: int = 8                  # frequency pilots
-    n_t: int = 4                  # time pilots within a frame (paper: 8×4 grid)
-    bandwidth_hz: float = 100e6   # 100 MHz (pilot subband)
-    carrier_freq_hz: float = 300e9  # 300 GHz
-    frame_duration_s: float = 100e-6  # 100 μs
-    
-    # SNR and quantization
+
+    # =========================================================================
+    # 基础参数（与V2相同）
+    # =========================================================================
+    n_f: int = 8
+    n_t: int = 4
+    bandwidth_hz: float = 100e6
+    carrier_freq_hz: float = 300e9
+    frame_duration_s: float = 100e-6
+
     snr_db: float = 10.0
     adc_bits: int = 4
     apply_quantization: bool = True
-    
-    # Normalization scales (state is normalized)
-    delay_scale: float = 1e-9     # 1 ns
-    doppler_scale: float = 1e3    # 1 kHz
-    phase_scale: float = 1.0      # 1 rad
-    
-    # Drift/transition (normalized-domain process noise)
-    nu_ar: float = 0.99           # AR coefficient for Doppler (slow variable)
-    q_std_norm: Tuple[float, float, float] = (0.02, 0.01, 0.05)  # (τ, ν, φ) in normalized coords
-    
-    # AQNM parameters (computed from adc_bits)
-    alpha_aqnm: float = field(default=1.0, init=False)
-    quant_var: float = field(default=0.0, init=False)
-    
+
+    delay_scale: float = 1e-9
+    doppler_scale: float = 1e3
+    phase_scale: float = 1.0
+
+    nu_ar: float = 0.99
+
     # =========================================================================
-    # TWC P0: Wideband stress-test switches (no state-dimension increase)
+    # P0: 连续相位噪声 Wiener 模型（新增）
+    # =========================================================================
+    enable_continuous_pn: bool = False
+    """启用连续相位噪声 Wiener 模型"""
+
+    pn_linewidth_hz: float = 100.0
+    """
+    振荡器3dB线宽 (Hz)
+
+    典型值：
+    - 高质量PLL @ 300GHz: 10-100 Hz
+    - 中等质量: 100-1000 Hz
+    - 自由运行VCO: 1-10 kHz
+
+    Wiener过程方差: σ²_φ = 2π * linewidth * T_frame
+    """
+
+    # 旧的固定q_std（当disable continuous PN时使用）
+    q_std_norm_tau: float = 0.02
+    q_std_norm_nu: float = 0.01
+    q_std_norm_phi: float = 0.05  # 仅当 enable_continuous_pn=False 时使用
+
+    # =========================================================================
+    # P0: Doppler squint（保留自V2）
     # =========================================================================
     enable_doppler_squint: bool = False
-    """
-    Doppler squint: frequency-dependent Doppler effect.
-    When enabled: ν_eff(f_i) = ν * (1 + f_i/f_c)
-    Physical basis: Doppler shift ∝ absolute frequency
-    Effect magnitude: Δν/ν ≈ B/f_c ≈ 3.3×10⁻⁴ for 100MHz/300GHz
-    """
-    
+    """Doppler squint: ν_eff(f) = ν * (1 + f/f_c)"""
+
+    # =========================================================================
+    # P1: 物理 Beam squint - ULA 阵列模型（新增）
+    # =========================================================================
+    enable_beam_squint: bool = False
+    """启用物理 Beam squint（ULA阵列频率-角度耦合）"""
+
+    beam_squint_n_ant: int = 16
+    """阵列天线数量"""
+
+    beam_squint_d_over_lambda: float = 0.5
+    """天线间距（波长倍数），0.5 = 半波长间距"""
+
+    beam_squint_theta0_deg: float = 0.0
+    """波束指向角度（度），0 = 正前方"""
+
+    # =========================================================================
+    # P2: Pointing jitter（新增）
+    # =========================================================================
+    enable_pointing_jitter: bool = False
+    """启用指向抖动（帧级增益波动）"""
+
+    pointing_jitter_std_deg: float = 0.1
+    """指向抖动标准差（度）"""
+
+    pointing_jitter_ar: float = 0.95
+    """指向抖动的AR(1)系数（慢变特性）"""
+
+    # =========================================================================
+    # AQNM（与V2相同）
+    # =========================================================================
+    alpha_aqnm: float = field(default=1.0, init=False)
+    quant_var: float = field(default=0.0, init=False)
+
+    # =========================================================================
+    # V2遗留（向后兼容，但建议用新的）
+    # =========================================================================
     enable_beam_squint_proxy: bool = False
-    """
-    Beam-squint proxy: frequency-selective gain roll-off.
-    Models wideband beam-forming mismatch without explicit array geometry.
-    When enabled: h(f_i) is multiplied by g(f_i) = exp(-0.5*(strength*f_i/f_edge)²)
-    """
-    
+    """旧版 beam squint proxy（仅向后兼容）"""
     beam_squint_strength: float = 0.0
-    """
-    Beam-squint proxy strength parameter.
-    0 = disabled, larger values = stronger frequency-selective fading.
-    Typical stress-test value: 1.0-3.0
-    """
 
 
 def _aqnm_params(bits: int) -> Tuple[float, float]:
-    """
-    Get AQNM parameters (alpha, sigma_q^2) for given ADC bits.
-    
-    TWC P0 Note on parameterization:
-    These are TABULATED AQNM coefficients for Gaussian inputs, where:
-    - alpha: Bussgang linear gain
-    - sigma_q^2: quantization distortion variance (as fraction of signal power)
-    
-    The values satisfy: effective_noise = awgn_var + sigma_q^2 / alpha^2
-    
-    Source: Standard AQNM tables for uniform quantization with Gaussian inputs.
-    The tabulated values are derived from Lloyd-Max optimal quantizer analysis.
-    
-    Note: At 1-2 bits, the i.i.d. Gaussian distortion assumption becomes
-    less accurate; AQNM is most reliable for 3-6 bits.
-    """
+    """AQNM 参数表"""
     table = {
-        1: (0.6366, 0.3634),   # 1-bit: severe quantization
+        1: (0.6366, 0.3634),
         2: (0.8825, 0.1175),
         3: (0.9625, 0.0375),
-        4: (0.9900, 0.0100),   # 4-bit: paper default
+        4: (0.9900, 0.0100),
         5: (0.9975, 0.0025),
         6: (0.9994, 0.0006),
         7: (0.9998, 0.0002),
@@ -150,416 +172,453 @@ def _aqnm_params(bits: int) -> Tuple[float, float]:
     }
     if bits in table:
         return table[bits]
-    # Conservative fallback for high resolution
     if bits >= 8:
         return (1.0, 0.0)
-    # Extrapolate for low bits (not recommended)
-    return (0.3634 * (4.0 ** (1 - bits)), 1.0 - 0.3634 * (4.0 ** (1 - bits)))
+    return (0.5, 0.5)
 
 
 # =========================================================================
-# Main Model Class
+# Main Model Class - V3
 # =========================================================================
 
 class THzISACModel:
     """
-    2D pilot grid THz-ISAC observation model.
-    
-    Observation model (standard):
-        h(f_i, t_j) = exp(-j*2π*f_i*τ) * exp(+j*2π*ν*t_j) * exp(+j*φ)
-    
-    Observation model (with Doppler squint):
-        h(f_i, t_j) = exp(-j*2π*f_i*τ) * exp(+j*2π*ν_eff(f_i)*t_j) * exp(+j*φ)
-        where ν_eff(f_i) = ν * (1 + f_i/f_c)
-    
-    Observation model (with beam-squint proxy):
-        h(f_i, t_j) = g(f_i) * [standard observation]
-        where g(f_i) is frequency-selective gain
-    
-    CRITICAL: Uses intra-frame time t_j only, NOT absolute time.
-    Cross-frame phase accumulation is in state transition only.
-    
-    State is normalized: x = [τ/τ_s, ν/ν_s, φ/φ_s]
-    
-    Key feature: Pilot time diversity (n_t >= 2) enables single-frame Doppler observability
+    THz-ISAC 观测模型 V3 - 完整物理建模
+
+    观测模型：
+        h(f_i, t_j) = g_bs(f_i) * g_pt * exp(-j2πf_i*τ + j2πν_eff*t_j + jφ)
+
+    其中：
+        - g_bs(f_i): Beam squint 增益（ULA阵列物理模型）
+        - g_pt: Pointing jitter 增益
+        - ν_eff: 可选 Doppler squint
+
+    状态转移：
+        φ_{k+1} = φ_k + 2πν_k*T + w_φ,k
+
+        w_φ,k ~ N(0, σ²_φ) 其中 σ²_φ = 2π * linewidth * T_frame（Wiener模型）
     """
-    
+
     def __init__(self, cfg: THzISACConfig):
         self.cfg = cfg
         self._init_pilots()
         self._init_noise()
-    
+        self._init_beam_squint()
+        self._init_pointing_jitter()
+
     def _init_pilots(self) -> None:
-        """Initialize 2D pilot grid (frequency x time)."""
+        """初始化2D导频网格"""
         cfg = self.cfg
-        
-        # Frequency grid centered at baseband
+
         self.f_grid = np.linspace(
             -cfg.bandwidth_hz / 2,
             cfg.bandwidth_hz / 2,
             cfg.n_f,
             endpoint=False
-        )  # [n_f]
-        
-        # Intra-frame pilot times, spread across frame
+        )
+
         self.t_grid = np.linspace(
             0.0,
             cfg.frame_duration_s,
             cfg.n_t,
             endpoint=False
-        )  # [n_t]
-        
-        # Vectorized measurement coordinates (frequency-major ordering)
-        # For ℓ = j + i*n_t: f_vec[ℓ] = f_i, t_vec[ℓ] = t_j
-        self.f_vec = np.repeat(self.f_grid, cfg.n_t)   # [m]
-        self.t_vec = np.tile(self.t_grid, cfg.n_f)     # [m]
+        )
+
+        self.f_vec = np.repeat(self.f_grid, cfg.n_t)
+        self.t_vec = np.tile(self.t_grid, cfg.n_f)
         self.m = cfg.n_f * cfg.n_t
-        
-        # Pre-compute beam-squint proxy gain if enabled
-        self._update_beam_squint_gain()
-    
-    def _update_beam_squint_gain(self) -> None:
-        """Pre-compute frequency-selective gain for beam-squint proxy."""
-        cfg = self.cfg
-        if cfg.enable_beam_squint_proxy and cfg.beam_squint_strength > 0:
-            # Normalized frequency: f_norm ∈ [-1, 1] across bandwidth
-            f_edge = cfg.bandwidth_hz / 2
-            f_norm = self.f_vec / max(f_edge, 1e-12)
-            # Gaussian roll-off centered at DC
-            self._beam_gain = np.exp(-0.5 * (cfg.beam_squint_strength * f_norm) ** 2)
-        else:
-            self._beam_gain = np.ones(self.m, dtype=float)
-    
+
     def _init_noise(self) -> None:
-        """Initialize noise parameters (AWGN + AQNM)."""
+        """初始化噪声参数"""
         cfg = self.cfg
-        
-        # AWGN variance in complex baseband: E|n|^2 = sigma^2
+
         snr_lin = 10.0 ** (cfg.snr_db / 10.0)
         self.awgn_var = 1.0 / snr_lin
-        
-        # AQNM parameters
+
         alpha, sigma_q_sq = _aqnm_params(cfg.adc_bits)
         cfg.alpha_aqnm = alpha
         cfg.quant_var = sigma_q_sq
         self.alpha = alpha
         self.quant_var = sigma_q_sq
-        
-        # Effective noise after AQNM scaling
-        # y_q = alpha*y + q, then ỹ = y_q/alpha = y + q/alpha
-        # Var(ỹ - h) = Var(n) + Var(q)/alpha² = awgn_var + quant_var/alpha²
-        self.sigma_eff_sq = self.awgn_var + (self.quant_var / max(alpha**2, 1e-12))
-    
+
+        self.sigma_eff_sq = self.awgn_var + (self.quant_var / max(alpha ** 2, 1e-12))
+
     # =========================================================================
-    # Normalization helpers
+    # P1: 物理 Beam squint - ULA 阵列模型
     # =========================================================================
-    
-    def denorm(self, x_norm: np.ndarray) -> Tuple[float, float, float]:
-        """Convert normalized state to physical units."""
+
+    def _init_beam_squint(self) -> None:
+        """
+        初始化物理 Beam squint 增益
+
+        ULA + analog phase shifter（在 f_c 设计）：
+
+        阵列响应: a_n(f,θ) = exp(j2π * f/c * d * (n-1) * sinθ)
+        波束权重: w_n = exp(-j2π * f_c/c * d * (n-1) * sinθ_0)
+
+        Beamforming增益:
+        g_bs(f) = (1/N) * |Σ exp(j2π * d/c * (n-1) * (f*sinθ - f_c*sinθ_0))|
+
+        当 θ = θ_0（指向正确，仅频率失配）:
+        g_bs(f) = |sin(Nπξ) / (N*sin(πξ))| 其中 ξ = d*(f-f_c)*sinθ_0/c
+        """
         cfg = self.cfg
-        tau = float(x_norm[0] * cfg.delay_scale)   # seconds
-        nu = float(x_norm[1] * cfg.doppler_scale)  # Hz
-        phi = float(x_norm[2] * cfg.phase_scale)   # rad
+
+        if not cfg.enable_beam_squint:
+            self._beam_squint_gain = np.ones(self.m, dtype=float)
+            return
+
+        N = cfg.beam_squint_n_ant
+        d = cfg.beam_squint_d_over_lambda * (3e8 / cfg.carrier_freq_hz)  # 物理间距
+        theta0 = np.radians(cfg.beam_squint_theta0_deg)
+        c = 3e8
+
+        # 计算每个频率点的beam squint增益
+        g_bs = np.zeros(self.m, dtype=float)
+
+        for i, f in enumerate(self.f_vec):
+            # 实际频率 = f_c + f（f是相对基带偏移）
+            f_abs = cfg.carrier_freq_hz + f
+
+            # 相位差参数
+            # ξ = d * (f_abs - f_c) * sin(θ_0) / c = d * f * sin(θ_0) / c
+            xi = d * f * np.sin(theta0) / c
+
+            # Dirichlet kernel (array factor)
+            if abs(xi) < 1e-12:
+                g_bs[i] = 1.0  # 无频率偏移时增益为1
+            else:
+                # |sin(Nπξ) / (N*sin(πξ))|
+                numerator = np.sin(N * np.pi * xi)
+                denominator = N * np.sin(np.pi * xi)
+                if abs(denominator) < 1e-12:
+                    g_bs[i] = 1.0
+                else:
+                    g_bs[i] = abs(numerator / denominator)
+
+        self._beam_squint_gain = g_bs
+
+        # 打印beam squint范围（调试用）
+        # print(f"Beam squint gain range: [{g_bs.min():.4f}, {g_bs.max():.4f}]")
+
+    # =========================================================================
+    # P2: Pointing jitter 状态
+    # =========================================================================
+
+    def _init_pointing_jitter(self) -> None:
+        """初始化 pointing jitter 状态"""
+        self._pointing_jitter_state = 0.0  # 当前角度偏移（rad）
+        self._pointing_gain = 1.0  # 当前帧增益
+
+    def _update_pointing_jitter(self, rng: np.random.Generator) -> float:
+        """
+        更新 pointing jitter 并返回帧增益
+
+        模型：
+        - δθ_k = ρ * δθ_{k-1} + w_θ,k  （AR(1)过程）
+        - g_pt = exp(-0.5 * (δθ/θ_3dB)²) （高斯波束近似）
+
+        其中 θ_3dB ≈ λ/(N*d) 是阵列半功率波束宽度
+        """
+        cfg = self.cfg
+
+        if not cfg.enable_pointing_jitter:
+            return 1.0
+
+        # AR(1) 更新
+        sigma_theta = np.radians(cfg.pointing_jitter_std_deg)
+        innovation_std = sigma_theta * np.sqrt(1 - cfg.pointing_jitter_ar ** 2)
+        w_theta = rng.normal(0, innovation_std)
+        self._pointing_jitter_state = cfg.pointing_jitter_ar * self._pointing_jitter_state + w_theta
+
+        # 计算3dB波束宽度（ULA近似）
+        if cfg.enable_beam_squint:
+            N = cfg.beam_squint_n_ant
+            d_over_lambda = cfg.beam_squint_d_over_lambda
+            theta_3dB = 0.886 / (N * d_over_lambda)  # 近似公式
+        else:
+            theta_3dB = np.radians(1.0)  # 默认1度
+
+        # 高斯波束增益
+        delta_theta = self._pointing_jitter_state
+        self._pointing_gain = np.exp(-0.5 * (delta_theta / theta_3dB) ** 2)
+
+        return self._pointing_gain
+
+    # =========================================================================
+    # 归一化辅助函数
+    # =========================================================================
+
+    def denorm(self, x_norm: np.ndarray) -> Tuple[float, float, float]:
+        """归一化状态 → 物理单位"""
+        cfg = self.cfg
+        tau = float(x_norm[0] * cfg.delay_scale)
+        nu = float(x_norm[1] * cfg.doppler_scale)
+        phi = float(x_norm[2] * cfg.phase_scale)
         return tau, nu, phi
-    
+
     def norm(self, tau: float, nu: float, phi: float) -> np.ndarray:
-        """Convert physical units to normalized state."""
+        """物理单位 → 归一化状态"""
         cfg = self.cfg
         return np.array([
             tau / cfg.delay_scale,
             nu / cfg.doppler_scale,
             phi / cfg.phase_scale,
         ], dtype=float)
-    
+
     def wrap_phase_norm(self, x_norm: np.ndarray) -> np.ndarray:
-        """Keep phase in [-π, π] in physical domain, map back to normalized."""
+        """相位wrap到[-π,π]"""
         cfg = self.cfg
         phi = x_norm[2] * cfg.phase_scale
-        phi = (phi + np.pi) % (2 * np.pi) - np.pi
+        phi = wrap_angle(phi)
         x_norm = x_norm.copy()
         x_norm[2] = phi / cfg.phase_scale
         return x_norm
-    
+
     # =========================================================================
-    # Dynamics (multi-frame fast/slow coupling)
+    # 状态转移（含连续PN Wiener模型）
     # =========================================================================
-    
+
     def transition(self, x_norm: np.ndarray) -> np.ndarray:
         """
-        State transition with fast/slow variable coupling.
-        
-        τ_{k+1} = τ_k + w_τ           (slow, nearly constant)
-        ν_{k+1} = ρ*ν_k + w_ν         (slow, AR(1) process)
-        φ_{k+1} = φ_k + 2π*ν*T + w_φ  (fast, driven by Doppler)
-        
-        This is where cross-frame phase accumulation happens.
+        状态转移（确定性部分）
+
+        τ_{k+1} = τ_k
+        ν_{k+1} = ρ * ν_k
+        φ_{k+1} = φ_k + 2π * ν * T_frame
         """
         cfg = self.cfg
         tau_n, nu_n, phi_n = x_norm
-        
-        # τ_{k+1} = τ_k (plus process noise added separately)
+
         tau_n_next = tau_n
-        
-        # ν_{k+1} = ρ*ν_k
         nu_n_next = cfg.nu_ar * nu_n
-        
-        # φ_{k+1} = φ_k + 2π*ν*T_frame
-        # Convert ν_n to Hz: nu = nu_n * doppler_scale
-        # Phase increment in rad: incr = 2π * nu * T
+
         incr = 2.0 * np.pi * (nu_n * cfg.doppler_scale) * cfg.frame_duration_s
         phi_n_next = phi_n + incr / cfg.phase_scale
-        
+
         x_next = np.array([tau_n_next, nu_n_next, phi_n_next], dtype=float)
         return self.wrap_phase_norm(x_next)
-    
+
     def F_jacobian(self) -> np.ndarray:
-        """
-        State transition Jacobian (linearization of transition).
-        
-        F = ∂f/∂x where x_next = f(x)
-        """
+        """状态转移 Jacobian"""
         cfg = self.cfg
         F = np.eye(3, dtype=float)
-        
-        # ν coefficient
         F[1, 1] = cfg.nu_ar
-        
-        # φ depends on ν: ∂φ_next/∂ν = 2π*T*doppler_scale/phase_scale
         F[2, 1] = (2.0 * np.pi * cfg.doppler_scale * cfg.frame_duration_s) / cfg.phase_scale
-        
         return F
-    
+
     def Q_cov(self) -> np.ndarray:
-        """Process noise covariance (normalized domain)."""
-        q = np.array(self.cfg.q_std_norm, dtype=float)
+        """
+        过程噪声协方差
+
+        P0 关键改动：当 enable_continuous_pn=True 时，
+        φ 的过程噪声由 linewidth 物理参数化：
+
+        σ²_φ = 2π * Δf_3dB * T_frame  (Wiener过程)
+
+        这是 Lorentzian 线宽的标准离散化模型。
+        """
+        cfg = self.cfg
+
+        q_tau = cfg.q_std_norm_tau
+        q_nu = cfg.q_std_norm_nu
+
+        if cfg.enable_continuous_pn:
+            # Wiener 模型：方差 = 2π * linewidth * T_frame
+            sigma_phi_sq = 2 * np.pi * cfg.pn_linewidth_hz * cfg.frame_duration_s
+            q_phi = np.sqrt(sigma_phi_sq) / cfg.phase_scale
+        else:
+            # 旧的固定参数
+            q_phi = cfg.q_std_norm_phi
+
+        q = np.array([q_tau, q_nu, q_phi], dtype=float)
         return np.diag(q * q)
-    
+
     # =========================================================================
-    # Measurement model (with optional wideband effects)
+    # 观测模型（含所有物理效应）
     # =========================================================================
-    
+
     def h(self, x_norm: np.ndarray, frame_idx: int) -> np.ndarray:
         """
-        Observation function h(x, t).
-        
-        Standard model:
-            h(f_i, t_j) = exp(-j*2π*f_i*τ) * exp(+j*2π*ν*t_j) * exp(+j*φ)
-        
-        With Doppler squint (enable_doppler_squint=True):
-            ν_eff(f_i) = ν * (1 + f_i/f_c)
-            h(f_i, t_j) = exp(-j*2π*f_i*τ) * exp(+j*2π*ν_eff*t_j) * exp(+j*φ)
-        
-        With beam-squint proxy (enable_beam_squint_proxy=True):
-            h is multiplied by pre-computed g(f_i)
-        
-        CRITICAL FIX (P0.5): Use intra-frame time t_j only, NOT absolute time.
-        Cross-frame phase accumulation is handled by state transition only.
-        This avoids "double counting" of Doppler information.
-        
-        Args:
-            x_norm: Normalized state [τ_n, ν_n, φ_n]
-            frame_idx: Frame index (unused in measurement, for API consistency)
-            
-        Returns:
-            h: Complex observation vector [m]
+        观测函数 h(x)
+
+        完整模型：
+        h(f_i, t_j) = g_bs(f_i) * exp(-j2πf_i*τ + j2πν_eff*t_j + jφ)
+
+        其中：
+        - g_bs(f_i): Beam squint 增益（ULA物理模型）
+        - ν_eff = ν*(1+f/f_c) 如果启用 Doppler squint
+
+        注意：Pointing jitter 增益在 observe() 中应用，不在 h() 中
+        （因为它是 model mismatch，估计器不应该知道）
         """
         cfg = self.cfg
         tau, nu, phi = self.denorm(x_norm)
-        
-        # Intra-frame pilot times (NOT absolute time)
-        t_intra = self.t_vec  # [m]
-        
-        # =====================================================================
-        # TWC P0: Doppler squint (frequency-dependent Doppler)
-        # =====================================================================
+
+        t_intra = self.t_vec
+
+        # Doppler squint
         if cfg.enable_doppler_squint:
-            # Physical basis: Doppler shift ∝ absolute frequency
-            # ν_eff(f_i) = ν * (f_c + f_i) / f_c = ν * (1 + f_i/f_c)
-            nu_eff = nu * (1.0 + self.f_vec / cfg.carrier_freq_hz)  # [m]
+            nu_eff = nu * (1.0 + self.f_vec / cfg.carrier_freq_hz)
         else:
-            nu_eff = nu  # scalar, broadcasts to [m]
-        
-        # Phase components
+            nu_eff = nu
+
+        # 基础相位
         phase = (-2.0 * np.pi * self.f_vec * tau) + (2.0 * np.pi * nu_eff * t_intra) + phi
-        h = np.exp(1j * phase)  # [m] complex
-        
-        # =====================================================================
-        # TWC P0: Beam-squint proxy (frequency-selective gain)
-        # =====================================================================
-        if cfg.enable_beam_squint_proxy and cfg.beam_squint_strength > 0:
-            h = self._beam_gain * h
-        
+        h = np.exp(1j * phase)
+
+        # Beam squint 增益
+        if cfg.enable_beam_squint:
+            h = self._beam_squint_gain * h
+        elif cfg.enable_beam_squint_proxy and cfg.beam_squint_strength > 0:
+            # 旧版 proxy（向后兼容）
+            f_edge = cfg.bandwidth_hz / 2
+            f_norm = self.f_vec / max(f_edge, 1e-12)
+            proxy_gain = np.exp(-0.5 * (cfg.beam_squint_strength * f_norm) ** 2)
+            h = proxy_gain * h
+
         return h
-    
+
     def jacobian(self, x_norm: np.ndarray, frame_idx: int) -> np.ndarray:
         """
-        Analytical Jacobian ∂h/∂x (w.r.t. normalized state).
-        
-        For h = g(f) * exp(j*ψ) where ψ = -2π*f*τ + 2π*ν_eff*t_j + φ:
-        
-        Standard (no squint):
-            ∂h/∂τ_n = (-j*2π*f) * h * delay_scale
-            ∂h/∂ν_n = (+j*2π*t_j) * h * doppler_scale
-            ∂h/∂φ_n = (j) * h * phase_scale
-        
-        With Doppler squint:
-            ∂h/∂ν_n = (+j*2π*t_j*(1+f_i/f_c)) * h * doppler_scale
-        
-        CRITICAL FIX (P0.5): Use intra-frame time t_j, not absolute time.
-        This matches h() and avoids double-counting Doppler information.
-        
-        Args:
-            x_norm: Normalized state [τ_n, ν_n, φ_n]
-            frame_idx: Frame index (unused, for API consistency)
-            
-        Returns:
-            J: Jacobian [m, 3] complex
+        解析 Jacobian ∂h/∂x
+
+        考虑 beam squint 和 Doppler squint 的影响
         """
         cfg = self.cfg
-        
-        # Intra-frame time only (matches h())
-        t_intra = self.t_vec  # [m]
-        
-        # Get observation at current state
-        h = self.h(x_norm, frame_idx)  # [m]
-        
-        # =====================================================================
-        # Derivatives w.r.t normalized coords
-        # =====================================================================
-        
-        # ∂h/∂τ_n: same for standard and squint models
+        t_intra = self.t_vec
+        h = self.h(x_norm, frame_idx)
+
+        # ∂h/∂τ_n
         d_tau = (1j * (-2.0 * np.pi * self.f_vec)) * h * cfg.delay_scale
-        
-        # ∂h/∂ν_n: modified for Doppler squint
+
+        # ∂h/∂ν_n
         if cfg.enable_doppler_squint:
-            # With squint: ν_eff = ν*(1 + f_i/f_c)
-            # ∂ψ/∂ν = 2π*t_j*(1 + f_i/f_c)
-            squint_factor = 1.0 + self.f_vec / cfg.carrier_freq_hz  # [m]
+            squint_factor = 1.0 + self.f_vec / cfg.carrier_freq_hz
             d_nu = (1j * (2.0 * np.pi * t_intra * squint_factor)) * h * cfg.doppler_scale
         else:
             d_nu = (1j * (2.0 * np.pi * t_intra)) * h * cfg.doppler_scale
-        
-        # ∂h/∂φ_n: same for all models
+
+        # ∂h/∂φ_n
         d_phi = (1j) * h * cfg.phase_scale
-        
-        J = np.stack([d_tau, d_nu, d_phi], axis=1)  # [m, 3] complex
+
+        J = np.stack([d_tau, d_nu, d_phi], axis=1)
         return J
-    
+
     def R_cov(self) -> np.ndarray:
-        """Observation noise covariance (complex-domain: σ_eff^2 * I)."""
+        """观测噪声协方差"""
         return self.sigma_eff_sq * np.eye(self.m, dtype=float)
-    
+
     # =========================================================================
-    # Observation generation (for simulation)
+    # 观测生成（含 pointing jitter）
     # =========================================================================
-    
+
     def observe(
-        self,
-        x_norm: np.ndarray,
-        frame_idx: int,
-        rng: Optional[np.random.Generator] = None,
+            self,
+            x_norm: np.ndarray,
+            frame_idx: int,
+            rng: Optional[np.random.Generator] = None,
     ) -> np.ndarray:
         """
-        Generate noisy observation (for simulation).
-        
-        y = h(x) + n, then AQNM quantization if enabled.
-        
-        Args:
-            x_norm: True normalized state
-            frame_idx: Frame index
-            rng: Random generator (optional)
-            
-        Returns:
-            y: Noisy observation [m] complex
+        生成带噪声的观测
+
+        y = g_pt * h(x) + n + AQNM
+
+        其中 g_pt 是 pointing jitter 增益（model mismatch）
         """
         if rng is None:
             rng = np.random.default_rng()
-        
+
         h = self.h(x_norm, frame_idx)
-        
-        # AWGN (complex)
+
+        # P2: Pointing jitter（作为 mismatch 注入）
+        if self.cfg.enable_pointing_jitter:
+            g_pt = self._update_pointing_jitter(rng)
+            h = g_pt * h
+
+        # AWGN
         n = np.sqrt(self.awgn_var / 2) * (
-            rng.standard_normal(self.m) + 1j * rng.standard_normal(self.m)
+                rng.standard_normal(self.m) + 1j * rng.standard_normal(self.m)
         )
         y = h + n
-        
-        # AQNM quantization
-        # y_q = alpha*y + q, then return equivalent observation ỹ = y_q/alpha
-        # This makes sigma_eff_sq = awgn_var + quant_var/alpha² consistent
+
+        # AQNM
         if self.cfg.apply_quantization and self.cfg.adc_bits < 12:
             q = np.sqrt(self.quant_var / 2) * (
-                rng.standard_normal(self.m) + 1j * rng.standard_normal(self.m)
+                    rng.standard_normal(self.m) + 1j * rng.standard_normal(self.m)
             )
             y_q = self.alpha * y + q
-            # Return equivalent observation (divide by alpha)
             y = y_q / self.alpha
-        
+
         return y
-    
+
     # =========================================================================
-    # Fisher Information (for PCRB)
+    # Fisher Information
     # =========================================================================
-    
+
     def compute_fim_data(self, x_norm: np.ndarray, frame_idx: int) -> np.ndarray:
-        """
-        Compute data Fisher Information Matrix.
-        
-        J_data = (2/σ²) * Re(J^H J) for complex Gaussian likelihood.
-        
-        This automatically uses the correct Jacobian (with/without squint)
-        based on the current configuration.
-        
-        Args:
-            x_norm: Linearization point
-            frame_idx: Frame index
-            
-        Returns:
-            J_data: [3, 3] real symmetric positive semi-definite
-        """
-        J = self.jacobian(x_norm, frame_idx)  # [m, 3] complex
-        
-        # For real-valued state with complex observations:
-        # J_data = (2/σ²) * Re(J^H J)
-        JHJ = J.conj().T @ J  # [3, 3] complex
+        """计算数据 Fisher Information Matrix"""
+        J = self.jacobian(x_norm, frame_idx)
+        JHJ = J.conj().T @ J
         J_data = (2.0 / max(self.sigma_eff_sq, 1e-12)) * np.real(JHJ)
-        
         return J_data
 
 
 # =========================================================================
-# Module-level factory functions
+# 工厂函数
 # =========================================================================
 
 def create_default_model(snr_db: float = 10.0, adc_bits: int = 4) -> THzISACModel:
-    """Create model with default configuration (matches paper Table I)."""
+    """创建默认模型（所有THz效应关闭，向后兼容）"""
     cfg = THzISACConfig(snr_db=snr_db, adc_bits=adc_bits)
     return THzISACModel(cfg)
 
 
-def create_model_with_squint(
-    snr_db: float = 10.0,
-    adc_bits: int = 4,
-    doppler_squint: bool = True,
-    beam_squint_strength: float = 1.0,
+def create_model_v3_full(
+        snr_db: float = 10.0,
+        adc_bits: int = 4,
+        # P0: 连续 PN
+        enable_continuous_pn: bool = True,
+        pn_linewidth_hz: float = 100.0,
+        # P0: Doppler squint
+        enable_doppler_squint: bool = True,
+        # P1: Beam squint
+        enable_beam_squint: bool = True,
+        n_ant: int = 16,
+        theta0_deg: float = 10.0,
+        # P2: Pointing jitter
+        enable_pointing_jitter: bool = False,
+        pointing_std_deg: float = 0.1,
 ) -> THzISACModel:
     """
-    Create model with wideband stress-test features enabled.
-    
-    For TWC Appendix stress-test experiments.
+    创建完整 V3 模型（所有物理效应可选）
+
+    推荐的 TWC 主文配置：
+    - enable_continuous_pn=True, pn_linewidth_hz=100
+    - enable_doppler_squint=True
+    - enable_beam_squint=True (附录 stress-test)
+    - enable_pointing_jitter=False (或作为 stress-test)
     """
     cfg = THzISACConfig(
         snr_db=snr_db,
         adc_bits=adc_bits,
-        enable_doppler_squint=doppler_squint,
-        enable_beam_squint_proxy=beam_squint_strength > 0,
-        beam_squint_strength=beam_squint_strength,
+        # P0
+        enable_continuous_pn=enable_continuous_pn,
+        pn_linewidth_hz=pn_linewidth_hz,
+        enable_doppler_squint=enable_doppler_squint,
+        # P1
+        enable_beam_squint=enable_beam_squint,
+        beam_squint_n_ant=n_ant,
+        beam_squint_theta0_deg=theta0_deg,
+        # P2
+        enable_pointing_jitter=enable_pointing_jitter,
+        pointing_jitter_std_deg=pointing_std_deg,
     )
     return THzISACModel(cfg)
 
 
 # =========================================================================
-# Backward compatibility alias
+# 向后兼容别名
 # =========================================================================
 
-# For existing code that imports from this module
 create_model = create_default_model
