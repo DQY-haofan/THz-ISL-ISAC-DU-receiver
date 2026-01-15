@@ -186,7 +186,17 @@ def run_p01_experiment():
     
     for snr in snr_list:
         print(f"\nSNR = {snr} dB")
-        cfg = THzISACConfig(n_f=8, n_t=4, snr_db=snr, adc_bits=4)
+        cfg = THzISACConfig(
+            n_f=8, n_t=4, snr_db=snr, adc_bits=4,
+            enable_continuous_pn=True,
+            pn_linewidth_hz=100.0,
+            enable_doppler_squint=True,
+            enable_beam_squint=True,
+            beam_squint_n_ant=64,
+            beam_squint_theta0_deg=15.0,
+            enable_pointing_jitter=True,
+            pointing_jitter_std_deg=0.1,
+        )
         model = THzISACModel(cfg)
         
         for seed in range(n_seeds):

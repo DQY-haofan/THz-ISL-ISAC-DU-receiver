@@ -119,16 +119,10 @@ def save_figure(fig, name):
 # ============================================================================
 
 def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
-                      bandwidth_hz=100e6, frame_duration_s=100e-6,
+                      bandwidth_hz=100e7, frame_duration_s=100e-6,
                       pn_linewidth_hz=100.0):
     """
-    创建THz-ISL配置 - V3完整物理模型版
-
-    TWC主文配置：
-    - P0: 连续PN Wiener模型（linewidth参数化）✅
-    - P0: Doppler squint ✅
-    - P1: Beam squint（pilot subband可忽略，默认关闭）
-    - P2: Pointing jitter（stress-test用，默认关闭）
+    创建THz-ISL配置 - V3完整物理模型版（全部效应启用）
     """
     return THzISACConfig(
         n_f=n_f,
@@ -137,18 +131,25 @@ def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
         adc_bits=adc_bits,
         bandwidth_hz=bandwidth_hz,
         frame_duration_s=frame_duration_s,
-        # ★★★ V3 THz物理效应 ★★★
-        # P0: 连续PN（主文启用）
-        enable_continuous_pn=True,
-        pn_linewidth_hz=pn_linewidth_hz,
-        # P0: Doppler squint（主文启用）
-        enable_doppler_squint=True,
-        # P1: Beam squint（pilot subband可忽略）
-        enable_beam_squint=False,
-        # P2: Pointing jitter（stress-test时启用）
-        enable_pointing_jitter=False,
-    )
 
+        # ===== P0: 相位噪声 =====
+        enable_continuous_pn=True,
+        pn_linewidth_hz=pn_linewidth_hz,  # 100 Hz (高质量振荡器)
+
+        # ===== P0: Doppler squint =====
+        enable_doppler_squint=True,
+
+        # ===== P1: Beam squint (新增启用) =====
+        enable_beam_squint=True,
+        beam_squint_n_ant=64,  # 64天线阵列
+        beam_squint_d_over_lambda=0.5,  # 半波长间距
+        beam_squint_theta0_deg=15.0,  # ★ 关键：非零指向角！
+
+        # ===== P2: Pointing jitter (新增启用) =====
+        enable_pointing_jitter=True,
+        pointing_jitter_std_deg=0.1,  # 0.1°抖动
+        pointing_jitter_ar=0.95,  # AR(1)系数
+    )
 
 # ============================================================================
 # CSV数据收集器
