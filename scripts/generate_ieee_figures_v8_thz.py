@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-THz-ISAC DU-MAP IEEE 格式图像生成 v8 - THz效应启用版
+THz-ISAC DU-MAP IEEE 格式图像生成 v9 - THz-ISL增强版
 ======================================================
 
-基于v7，启用Doppler squint效应，使模型更贴近THz-ISL物理现实。
+基于v8，优化图像组合：
+- 删除4张低价值图：ber_vs_L_multiSNR, sensitivity_nu, sensitivity_tau, improvement_bar
+- 新增3张THz-ISL关键图：pointing_jitter_impact, beam_squint_wideband, thz_vs_mmwave
+- 改进slip_2d_heatmap为合并对比版
 
-关键修改：
-1. 所有THzISACConfig调用添加 enable_doppler_squint=True
-2. 新增3张THz-specific主文图（来自generate_thz_specific_figures.py）
-3. 保持所有其他设置不变
+保留所有对比算法：EKF, IEKF-4, GN-6, DU-tun-6
 
 使用方法：
-    python3 generate_ieee_figures_v8_thz.py
+    python3 generate_ieee_figures_v9_thz.py
 
 输出：outputs/ 目录下所有图像和CSV数据
 """
@@ -46,12 +46,16 @@ IEEE_HEIGHT = 2.6
 IEEE_FONTSIZE = 9
 IEEE_DPI = 300
 
+# 所有方法的颜色配置
 COLORS = {
     'EKF': '#E41A1C',
     'IEKF-4': '#FF7F00',
     'GN-6': '#377EB8',
     'DU-tun-6': '#4DAF4A',
     'PCRB': '#000000',
+    # 额外颜色用于扩展
+    'GN-6-nosq': '#377EB8',
+    'DU-tun-6-nosq': '#4DAF4A',
 }
 
 MARKERS = {
@@ -68,6 +72,7 @@ LINESTYLES = {
     'DU-tun-6': '-',
 }
 
+# 多SNR颜色（保留用于可能的扩展）
 MULTI_SNR_COLORS = {
     0: '#1f77b4',
     5: '#ff7f0e',
@@ -76,16 +81,17 @@ MULTI_SNR_COLORS = {
     20: '#9467bd',
 }
 
-MULTI_SNR_LINESTYLES = {
-    0: '-',
-    5: '--',
-    10: '-.',
-    15: ':',
-    20: '-',
+# 载频颜色
+FC_COLORS = {
+    10: '#1f77b4',
+    60: '#ff7f0e',
+    100: '#2ca02c',
+    300: '#d62728',
 }
 
 
 def setup_ieee_style():
+    """设置IEEE论文图像样式"""
     plt.rcParams.update({
         'font.size': IEEE_FONTSIZE,
         'axes.labelsize': IEEE_FONTSIZE,
@@ -108,6 +114,7 @@ def setup_ieee_style():
 
 
 def save_figure(fig, name):
+    """保存图像为PNG和PDF格式"""
     fig.savefig(f'{OUTPUT_DIR}/{name}.png', dpi=IEEE_DPI, bbox_inches='tight', pad_inches=0.02)
     fig.savefig(f'{OUTPUT_DIR}/{name}.pdf', bbox_inches='tight', pad_inches=0.02)
     plt.close(fig)
@@ -115,14 +122,33 @@ def save_figure(fig, name):
 
 
 # ============================================================================
-# ★★★ 关键函数：创建THz配置（启用Doppler Squint）★★★
+# THz配置工厂函数
 # ============================================================================
 
 def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
-                      bandwidth_hz=100e7, frame_duration_s=100e-6,
-                      pn_linewidth_hz=100.0):
+                      bandwidth_hz=100e6, frame_duration_s=100e-6,
+                      pn_linewidth_hz=100.0,
+                      enable_beam_squint=True,
+                      enable_pointing_jitter=True,
+                      pointing_jitter_std_deg=0.1,
+                      beam_squint_n_ant=64,
+                      beam_squint_theta0_deg=15.0):
     """
     创建THz-ISL配置 - V3完整物理模型版（全部效应启用）
+
+    Args:
+        n_f: 频率导频数
+        n_t: 时间导频数
+        snr_db: 信噪比
+        adc_bits: ADC位数
+        bandwidth_hz: 带宽
+        frame_duration_s: 帧时长
+        pn_linewidth_hz: 相位噪声线宽
+        enable_beam_squint: 是否启用beam squint
+        enable_pointing_jitter: 是否启用pointing jitter
+        pointing_jitter_std_deg: pointing jitter标准差(度)
+        beam_squint_n_ant: 天线数量
+        beam_squint_theta0_deg: 波束指向角(度)
     """
     return THzISACConfig(
         n_f=n_f,
@@ -134,28 +160,31 @@ def create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4,
 
         # ===== P0: 相位噪声 =====
         enable_continuous_pn=True,
-        pn_linewidth_hz=pn_linewidth_hz,  # 100 Hz (高质量振荡器)
+        pn_linewidth_hz=pn_linewidth_hz,
 
         # ===== P0: Doppler squint =====
         enable_doppler_squint=True,
 
-        # ===== P1: Beam squint (新增启用) =====
-        enable_beam_squint=True,
-        beam_squint_n_ant=64,  # 64天线阵列
-        beam_squint_d_over_lambda=0.5,  # 半波长间距
-        beam_squint_theta0_deg=15.0,  # ★ 关键：非零指向角！
+        # ===== P1: Beam squint =====
+        enable_beam_squint=enable_beam_squint,
+        beam_squint_n_ant=beam_squint_n_ant,
+        beam_squint_d_over_lambda=0.5,
+        beam_squint_theta0_deg=beam_squint_theta0_deg,
 
-        # ===== P2: Pointing jitter (新增启用) =====
-        enable_pointing_jitter=True,
-        pointing_jitter_std_deg=0.1,  # 0.1°抖动
-        pointing_jitter_ar=0.95,  # AR(1)系数
+        # ===== P2: Pointing jitter =====
+        enable_pointing_jitter=enable_pointing_jitter,
+        pointing_jitter_std_deg=pointing_jitter_std_deg,
+        pointing_jitter_ar=0.95,
     )
+
 
 # ============================================================================
 # CSV数据收集器
 # ============================================================================
 
 class DataCollector:
+    """收集所有实验数据用于CSV输出"""
+
     def __init__(self):
         self.performance_data = []
         self.sensitivity_data = []
@@ -202,8 +231,8 @@ class DataCollector:
             'GN6_rmse_std': gn_std,
             'DU_rmse_mean': du_mean,
             'DU_rmse_std': du_std,
-            'improvement_vs_EKF_pct': (ekf_mean - du_mean) / ekf_mean * 100,
-            'improvement_vs_GN_pct': (gn_mean - du_mean) / gn_mean * 100,
+            'improvement_vs_EKF_pct': (ekf_mean - du_mean) / ekf_mean * 100 if ekf_mean > 0 else 0,
+            'improvement_vs_GN_pct': (gn_mean - du_mean) / gn_mean * 100 if gn_mean > 0 else 0,
             'n_seeds': n_seeds
         })
 
@@ -213,6 +242,7 @@ class DataCollector:
         self.auxiliary_data.append(row)
 
     def save_all(self):
+        """保存所有CSV数据"""
         if self.performance_data:
             headers = ['experiment', 'sweep_variable', 'sweep_value', 'method',
                        'metric', 'mean', 'std', 'sem', 'n_seeds', 'n_frames']
@@ -252,18 +282,34 @@ class DataCollector:
             print(f"  ✓ data_auxiliary.csv ({len(self.auxiliary_data)} rows)")
 
 
+# 全局数据收集器
 collector = DataCollector()
 
 
 # ============================================================================
-# DU配置
+# DU配置和估计器运行函数
 # ============================================================================
 
 def get_du_step_scale():
+    """获取DU-MAP的步长缩放参数"""
     return np.array([1.0, 0.1, 1.5])
 
 
-def run_estimator(method, model, y_seq, x0, P0):
+def run_estimator(method: str, model: THzISACModel, y_seq: List,
+                  x0: np.ndarray, P0: np.ndarray) -> List[np.ndarray]:
+    """
+    运行指定的估计器
+
+    Args:
+        method: 方法名称 ('EKF', 'IEKF-4', 'GN-6', 'DU-tun-6' 等)
+        model: THz-ISAC模型
+        y_seq: 观测序列
+        x0: 初始状态
+        P0: 初始协方差
+
+    Returns:
+        估计状态序列
+    """
     if method == 'EKF':
         est = create_ekf('wrapped')
         return est.run_sequence(model, y_seq, x0, P0)[0]
@@ -281,10 +327,12 @@ def run_estimator(method, model, y_seq, x0, P0):
         cfg.step_scale = get_du_step_scale()
         est = DUMAP(cfg)
         return est.forward_sequence(model, y_seq, x0, P0)[0]
-    raise ValueError(f"Unknown method: {method}")
+    else:
+        raise ValueError(f"Unknown method: {method}")
 
 
-def compute_rmse(x_hat, x_true):
+def compute_rmse(x_hat: List[np.ndarray], x_true: List[np.ndarray]) -> Tuple[float, float]:
+    """计算总体RMSE（含相位wrapping）"""
     errors = []
     for xh, xt in zip(x_hat, x_true):
         e = xh - xt
@@ -293,7 +341,8 @@ def compute_rmse(x_hat, x_true):
     return np.mean(errors), np.std(errors)
 
 
-def compute_phase_rmse(x_hat, x_true):
+def compute_phase_rmse(x_hat: List[np.ndarray], x_true: List[np.ndarray]) -> float:
+    """计算相位RMSE"""
     errors = []
     for xh, xt in zip(x_hat, x_true):
         e_phi = wrap_angle(xh[2] - xt[2])
@@ -301,12 +350,25 @@ def compute_phase_rmse(x_hat, x_true):
     return np.sqrt(np.mean(errors))
 
 
+def compute_component_rmse(x_hat: List[np.ndarray], x_true: List[np.ndarray]) -> Tuple[float, float, float]:
+    """计算各分量RMSE: (tau, nu, phi)"""
+    tau_err, nu_err, phi_err = [], [], []
+    for xh, xt in zip(x_hat, x_true):
+        tau_err.append((xh[0] - xt[0]) ** 2)
+        nu_err.append((xh[1] - xt[1]) ** 2)
+        phi_err.append(wrap_angle(xh[2] - xt[2]) ** 2)
+    return np.sqrt(np.mean(tau_err)), np.sqrt(np.mean(nu_err)), np.sqrt(np.mean(phi_err))
+
+
 # ============================================================================
-# 核心图
+# 核心图 (6张)
 # ============================================================================
 
 def fig_ber_vs_snr():
-    """BER vs SNR"""
+    """
+    核心图1: BER vs SNR
+    比较所有4种方法在不同SNR下的BER性能
+    """
     print("\nFig: BER vs SNR")
 
     snr_list = [0, 5, 10, 15, 20]
@@ -321,7 +383,6 @@ def fig_ber_vs_snr():
 
     for snr in snr_list:
         print(f"  SNR={snr}dB...", end=" ", flush=True)
-        # ★ 使用THz配置 ★
         cfg = create_thz_config(n_f=8, n_t=4, snr_db=snr, adc_bits=4)
         model = THzISACModel(cfg)
 
@@ -340,6 +401,7 @@ def fig_ber_vs_snr():
                                       n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     for method in methods:
         ber_means = [np.mean(results[snr][method]) for snr in snr_list]
@@ -356,7 +418,9 @@ def fig_ber_vs_snr():
 
 
 def fig_rmse_vs_snr():
-    """RMSE vs SNR"""
+    """
+    核心图2: RMSE vs SNR (含PCRB下界)
+    """
     print("\nFig: RMSE vs SNR")
 
     snr_list = [0, 5, 10, 15, 20]
@@ -375,6 +439,7 @@ def fig_rmse_vs_snr():
         cfg = create_thz_config(n_f=8, n_t=4, snr_db=snr, adc_bits=4)
         model = THzISACModel(cfg)
 
+        # 计算PCRB
         pcrb_rec = PCRBRecursion(d=3)
         pcrb_seq, _ = pcrb_rec.run_sequence(model, [x0] * 50)
         pcrb_avg = np.sqrt(np.mean([np.sum(p) for p in pcrb_seq[10:]]))
@@ -395,6 +460,7 @@ def fig_rmse_vs_snr():
                                       n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     for method in methods:
         rmse_means = [np.mean(results[snr][method]) for snr in snr_list]
@@ -412,7 +478,10 @@ def fig_rmse_vs_snr():
 
 
 def fig_rmse_vs_L():
-    """RMSE vs 迭代层数 L - 包含EKF和IEKF基线"""
+    """
+    核心图3: RMSE vs 迭代层数 L
+    包含EKF基线和IEKF/GN/DU对比
+    """
     print("\nFig: RMSE vs L")
 
     L_list = [1, 2, 4, 6, 8, 10]
@@ -424,11 +493,8 @@ def fig_rmse_vs_L():
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
     model = THzISACModel(cfg)
 
-    # EKF基线（L=1，单次）
     ekf_results = []
-    # IEKF结果（不同迭代次数）
     iekf_results = {L: [] for L in L_list}
-    # GN和DU结果
     gn_results = {L: [] for L in L_list}
     du_results = {L: [] for L in L_list}
 
@@ -438,7 +504,7 @@ def fig_rmse_vs_L():
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
 
-            # EKF (只在L=1时计算一次)
+            # EKF (只在L=1时计算)
             if L == 1:
                 x_ekf = run_estimator('EKF', model, y_seq, x0, P0)
                 rmse_ekf, _ = compute_rmse(x_ekf, x_true)
@@ -511,7 +577,9 @@ def fig_rmse_vs_L():
 
 
 def fig_recovery_time():
-    """Slip恢复时间"""
+    """
+    核心图4: Slip恢复时间箱线图
+    """
     print("\nFig: Recovery Time")
 
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
@@ -551,6 +619,7 @@ def fig_recovery_time():
                                     median=np.median(recovery_times[m]),
                                     n_samples=len(recovery_times[m]))
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     positions = range(len(methods))
     bp = ax.boxplot([recovery_times[m] for m in methods], positions=positions,
@@ -568,9 +637,12 @@ def fig_recovery_time():
     save_figure(fig, 'fig_recovery_time')
 
 
-def fig_slip_2d_heatmap():
-    """Slip严重度 2D热力图"""
-    print("\nFig: Slip 2D Heatmap")
+def fig_slip_heatmap_combined():
+    """
+    核心图5: Slip严重度热力图 (合并版 - DU改进百分比)
+    显示DU相对于EKF的改进百分比
+    """
+    print("\nFig: Slip Heatmap Combined")
 
     amplitudes = [0.5, 1.0, 1.5, 2.0]
     p_slips = [0.01, 0.03, 0.05, 0.1]
@@ -584,11 +656,11 @@ def fig_slip_2d_heatmap():
     ekf_grid = np.zeros((len(amplitudes), len(p_slips)))
     gn_grid = np.zeros((len(amplitudes), len(p_slips)))
     du_grid = np.zeros((len(amplitudes), len(p_slips)))
+    improvement_grid = np.zeros((len(amplitudes), len(p_slips)))
 
     for i, amp in enumerate(amplitudes):
         for j, p_slip in enumerate(p_slips):
             print(f"  amp={amp}π, p_slip={p_slip}...", end=" ", flush=True)
-            # 使用values和probs参数指定slip幅度
             slip_cfg = SlipConfig(
                 p_slip=p_slip,
                 values=(amp * np.pi, -amp * np.pi),
@@ -612,28 +684,42 @@ def fig_slip_2d_heatmap():
             gn_grid[i, j] = np.mean(gn_rmse)
             du_grid[i, j] = np.mean(du_rmse)
 
+            # 计算DU相对于EKF的改进
+            improvement_grid[i, j] = (ekf_grid[i, j] - du_grid[i, j]) / ekf_grid[i, j] * 100
+
             collector.add_heatmap(amp, p_slip,
                                   np.mean(ekf_rmse), np.std(ekf_rmse),
                                   np.mean(gn_rmse), np.std(gn_rmse),
                                   np.mean(du_rmse), np.std(du_rmse), n_seeds)
             print("done")
 
-    for name, grid in [('EKF', ekf_grid), ('GN6', gn_grid), ('DU', du_grid)]:
-        fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-        im = ax.imshow(grid, cmap='YlOrRd', aspect='auto', origin='lower')
-        ax.set_xticks(range(len(p_slips)))
-        ax.set_xticklabels([f'{p}' for p in p_slips])
-        ax.set_yticks(range(len(amplitudes)))
-        ax.set_yticklabels([f'{a}π' for a in amplitudes])
-        ax.set_xlabel('Slip Probability $p_{slip}$')
-        ax.set_ylabel('Slip Amplitude')
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('RMSE')
-        save_figure(fig, f'fig_slip_2d_heatmap_{name}')
+    # 绘制合并图：DU改进百分比热力图
+    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
+    im = ax.imshow(improvement_grid, cmap='RdYlGn', aspect='auto', origin='lower',
+                   vmin=0, vmax=100)
+    ax.set_xticks(range(len(p_slips)))
+    ax.set_xticklabels([f'{p}' for p in p_slips])
+    ax.set_yticks(range(len(amplitudes)))
+    ax.set_yticklabels([f'{a}π' for a in amplitudes])
+    ax.set_xlabel('Slip Probability $p_{slip}$')
+    ax.set_ylabel('Slip Amplitude')
+
+    # 添加数值标注
+    for i in range(len(amplitudes)):
+        for j in range(len(p_slips)):
+            text = ax.text(j, i, f'{improvement_grid[i, j]:.0f}%',
+                           ha='center', va='center', fontsize=7,
+                           color='white' if improvement_grid[i, j] > 50 else 'black')
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('DU Improvement vs EKF (%)')
+    save_figure(fig, 'fig_slip_heatmap_improvement')
 
 
 def fig_phase_tracking():
-    """相位跟踪轨迹图"""
+    """
+    核心图6: 相位跟踪轨迹图
+    """
     print("\nFig: Phase Tracking")
 
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
@@ -657,6 +743,7 @@ def fig_phase_tracking():
                                 phi_DU=x_du[k][2],
                                 is_slip_frame=(k in slip_frames))
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH * 1.2, IEEE_HEIGHT))
 
     frames = range(len(x_true))
@@ -685,11 +772,13 @@ def fig_phase_tracking():
 
 
 # ============================================================================
-# BER系列图
+# BER系列图 (3张)
 # ============================================================================
 
 def fig_ber_vs_L():
-    """BER vs L - 包含EKF和IEKF基线"""
+    """
+    BER图1: BER vs L
+    """
     print("\nFig: BER vs L")
 
     L_list = [1, 2, 4, 6, 8, 10]
@@ -712,24 +801,20 @@ def fig_ber_vs_L():
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
 
-            # EKF
             if L == 1:
                 x_ekf = run_estimator('EKF', model, y_seq, x0, P0)
                 ber_ekf, _ = quick_ber_evm(x_true, x_ekf, 10, seed)
                 ekf_results.append(ber_ekf * 100)
 
-            # IEKF-L
             x_iekf = run_estimator(f'IEKF-{L}', model, y_seq, x0, P0)
             ber_iekf, _ = quick_ber_evm(x_true, x_iekf, 10, seed)
             iekf_results[L].append(ber_iekf * 100)
 
-            # GN-L
             gn = GaussNewtonMAP(GNSolverConfig(max_iters=L))
             x_gn = gn.solve_sequence(model, y_seq, x0, P0)[0]
             ber_gn, _ = quick_ber_evm(x_true, x_gn, 10, seed)
             gn_results[L].append(ber_gn * 100)
 
-            # DU-L
             du_cfg = DUMAPConfig(n_layers=L)
             du_cfg.step_scale = get_du_step_scale()
             du = DUMAP(du_cfg)
@@ -752,22 +837,19 @@ def fig_ber_vs_L():
                                   n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
 
-    # EKF基线
     ekf_mean = np.mean(ekf_results)
     ax.axhline(y=ekf_mean, color=COLORS['EKF'], linestyle='--',
                label='EKF (L=1)', linewidth=1.2, alpha=0.8)
 
-    # IEKF
     iekf_means = [np.mean(iekf_results[L]) for L in L_list]
     ax.plot(L_list, iekf_means, '^-', color=COLORS['IEKF-4'], label='IEKF')
 
-    # GN
     gn_means = [np.mean(gn_results[L]) for L in L_list]
     ax.plot(L_list, gn_means, 's-', color=COLORS['GN-6'], label='GN')
 
-    # DU
     du_means = [np.mean(du_results[L]) for L in L_list]
     ax.plot(L_list, du_means, 'D-', color=COLORS['DU-tun-6'], label='DU-tun')
 
@@ -780,59 +862,10 @@ def fig_ber_vs_L():
     save_figure(fig, 'fig_ber_vs_L')
 
 
-
-def fig_ber_vs_L_multiSNR():
-    """BER vs L (多SNR)"""
-    print("\nFig: BER vs L (multi-SNR)")
-
-    L_list = [1, 2, 4, 6, 8]
-    snr_list = [0, 5, 10, 15, 20]
-    x0 = np.array([1.0, 0.5, 0.0])
-    P0 = np.eye(3) * 0.1
-    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 20, 100
-
-    results = {snr: {L: [] for L in L_list} for snr in snr_list}
-
-    for snr in snr_list:
-        cfg = create_thz_config(n_f=8, n_t=4, snr_db=snr, adc_bits=4)
-        model = THzISACModel(cfg)
-
-        for L in L_list:
-            print(f"  SNR={snr}dB, L={L}...", end=" ", flush=True)
-            for seed in range(n_seeds):
-                y_seq, x_true, _, _ = generate_episode_with_impairments(
-                    model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
-
-                du_cfg = DUMAPConfig(n_layers=L)
-                du_cfg.step_scale = get_du_step_scale()
-                du = DUMAP(du_cfg)
-                x_du = du.forward_sequence(model, y_seq, x0, P0)[0]
-                ber, _ = quick_ber_evm(x_true, x_du, snr, seed)
-                results[snr][L].append(ber * 100)
-
-            collector.add_performance('ber_vs_L_multiSNR', 'L', L, f'DU_SNR{snr}',
-                                      'BER_pct', np.mean(results[snr][L]),
-                                      np.std(results[snr][L]), n_seeds, n_frames)
-            print("done")
-
-    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    for snr in snr_list:
-        means = [np.mean(results[snr][L]) for L in L_list]
-        ax.plot(L_list, means, marker='o',
-                color=MULTI_SNR_COLORS[snr],
-                linestyle=MULTI_SNR_LINESTYLES[snr],
-                label=f'SNR={snr}dB')
-    ax.set_xlabel('Number of Layers $L$')
-    ax.set_ylabel('BER (%)')
-    ax.legend(loc='upper right', fontsize=7)
-    ax.grid(True, alpha=0.3)
-    ax.set_xticks(L_list)
-    save_figure(fig, 'fig_ber_vs_L_multiSNR')
-
-
 def fig_ber_vs_pslip():
-    """BER vs p_slip"""
+    """
+    BER图2: BER vs p_slip
+    """
     print("\nFig: BER vs p_slip")
 
     p_slip_list = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15]
@@ -865,11 +898,12 @@ def fig_ber_vs_pslip():
                                       np.std(results[p_slip][m]), n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     for method in methods:
         means = [np.mean(results[p][method]) for p in p_slip_list]
-        marker = 'x' if method == 'EKF' else 's' if method == 'GN-6' else 'D'
-        ax.plot(p_slip_list, means, marker=marker, color=COLORS[method], label=method)
+        ax.plot(p_slip_list, means, marker=MARKERS[method],
+                color=COLORS[method], label=method)
     ax.set_xlabel('Slip Probability $p_{slip}$')
     ax.set_ylabel('BER (%)')
     ax.legend(loc='upper left')
@@ -878,7 +912,9 @@ def fig_ber_vs_pslip():
 
 
 def fig_ber_vs_adc():
-    """BER vs ADC bits"""
+    """
+    BER图3: BER vs ADC bits
+    """
     print("\nFig: BER vs ADC")
 
     adc_list = [2, 3, 4, 5, 6, 8]
@@ -911,11 +947,12 @@ def fig_ber_vs_adc():
                                       np.std(results[bits][m]), n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     for method in methods:
         means = [np.mean(results[b][method]) for b in adc_list]
-        marker = 'x' if method == 'EKF' else 's' if method == 'GN-6' else 'D'
-        ax.plot(adc_list, means, marker=marker, color=COLORS[method], label=method)
+        ax.plot(adc_list, means, marker=MARKERS[method],
+                color=COLORS[method], label=method)
     ax.set_xlabel('ADC Resolution (bits)')
     ax.set_ylabel('BER (%)')
     ax.legend(loc='upper right')
@@ -924,60 +961,15 @@ def fig_ber_vs_adc():
     save_figure(fig, 'fig_ber_vs_adc')
 
 
-def fig_phase_rmse_vs_frame_duration():
-    """Phase RMSE vs frame duration"""
-    print("\nFig: Phase RMSE vs Frame Duration")
-
-    fd_list = [50e-6, 100e-6, 200e-6, 500e-6, 1e-3]
-    methods = ['EKF', 'GN-6', 'DU-tun-6']
-
-    x0 = np.array([1.0, 0.5, 0.0])
-    P0 = np.eye(3) * 0.1
-    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 30, 100
-
-    results = {fd: {m: [] for m in methods} for fd in fd_list}
-
-    for fd in fd_list:
-        print(f"  T_fr={fd * 1e6:.0f}μs...", end=" ", flush=True)
-        cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4, frame_duration_s=fd)
-        model = THzISACModel(cfg)
-
-        for seed in range(n_seeds):
-            y_seq, x_true, _, _ = generate_episode_with_impairments(
-                model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
-
-            for method in methods:
-                x_hat = run_estimator(method, model, y_seq, x0, P0)
-                rmse = compute_phase_rmse(x_hat, x_true)
-                results[fd][method].append(rmse)
-
-        for m in methods:
-            collector.add_performance('phase_rmse_vs_fd', 'frame_duration_us',
-                                      fd * 1e6, m, 'Phase_RMSE',
-                                      np.mean(results[fd][m]), np.std(results[fd][m]),
-                                      n_seeds, n_frames)
-        print("done")
-
-    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    fd_us = [fd * 1e6 for fd in fd_list]
-    for method in methods:
-        means = [np.mean(results[fd][method]) for fd in fd_list]
-        marker = 'x' if method == 'EKF' else 's' if method == 'GN-6' else 'D'
-        ax.semilogx(fd_us, means, marker=marker, color=COLORS[method], label=method)
-    ax.set_xlabel('Frame Duration ($\\mu$s)')
-    ax.set_ylabel('Phase RMSE (rad)')
-    ax.legend(loc='upper left')
-    ax.grid(True, alpha=0.3)
-    save_figure(fig, 'fig_phase_rmse_vs_frame_duration')
-
-
 # ============================================================================
-# 敏感性分析
+# 敏感性分析 (1张 - 只保留phi)
 # ============================================================================
 
 def fig_sensitivity_phi():
-    """步长敏感性 - φ"""
+    """
+    敏感性图: 相位步长敏感性分析
+    这是最关键的参数，因为相位是THz系统最敏感的分量
+    """
     print("\nFig: Sensitivity (phi)")
 
     alpha_phi_list = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
@@ -1007,6 +999,7 @@ def fig_sensitivity_phi():
                                   np.mean(results[alpha]), np.std(results[alpha]), n_seeds)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     means = [np.mean(results[a]) for a in alpha_phi_list]
     stds = [np.std(results[a]) for a in alpha_phi_list]
@@ -1020,153 +1013,15 @@ def fig_sensitivity_phi():
     save_figure(fig, 'fig_sensitivity_phi')
 
 
-def fig_sensitivity_nu():
-    """步长敏感性 - ν"""
-    print("\nFig: Sensitivity (nu)")
-
-    alpha_nu_list = [0.02, 0.05, 0.1, 0.2, 0.5]
-    cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
-    model = THzISACModel(cfg)
-    x0 = np.array([1.0, 0.5, 0.0])
-    P0 = np.eye(3) * 0.1
-    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 30, 100
-
-    results = {a: [] for a in alpha_nu_list}
-
-    for alpha in alpha_nu_list:
-        print(f"  α_ν={alpha}...", end=" ", flush=True)
-        for seed in range(n_seeds):
-            y_seq, x_true, _, _ = generate_episode_with_impairments(
-                model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
-
-            du_cfg = DUMAPConfig(n_layers=6)
-            du_cfg.step_scale = np.array([1.0, alpha, 1.5])
-            du = DUMAP(du_cfg)
-            x_du = du.forward_sequence(model, y_seq, x0, P0)[0]
-            rmse, _ = compute_rmse(x_du, x_true)
-            results[alpha].append(rmse)
-
-        collector.add_sensitivity('alpha_nu', alpha,
-                                  np.mean(results[alpha]), np.std(results[alpha]), n_seeds)
-        print("done")
-
-    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    means = [np.mean(results[a]) for a in alpha_nu_list]
-    stds = [np.std(results[a]) for a in alpha_nu_list]
-    ax.errorbar(alpha_nu_list, means, yerr=stds, marker='s',
-                color='#377EB8', capsize=3, linewidth=1.5, markersize=7)
-    ax.axvline(0.1, color='gray', linestyle='--', alpha=0.7, label='Default (0.1)')
-    ax.set_xlabel(r'Doppler Step Scale $\alpha_\nu$')
-    ax.set_ylabel('RMSE')
-    ax.set_xscale('log')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    save_figure(fig, 'fig_sensitivity_nu')
-
-
-def fig_sensitivity_tau():
-    """步长敏感性 - τ"""
-    print("\nFig: Sensitivity (tau)")
-
-    alpha_tau_list = [0.2, 0.5, 1.0, 2.0, 5.0]
-    cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
-    model = THzISACModel(cfg)
-    x0 = np.array([1.0, 0.5, 0.0])
-    P0 = np.eye(3) * 0.1
-    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 30, 100
-
-    results = {a: [] for a in alpha_tau_list}
-
-    for alpha in alpha_tau_list:
-        print(f"  α_τ={alpha}...", end=" ", flush=True)
-        for seed in range(n_seeds):
-            y_seq, x_true, _, _ = generate_episode_with_impairments(
-                model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
-
-            du_cfg = DUMAPConfig(n_layers=6)
-            du_cfg.step_scale = np.array([alpha, 0.1, 1.5])
-            du = DUMAP(du_cfg)
-            x_du = du.forward_sequence(model, y_seq, x0, P0)[0]
-            rmse, _ = compute_rmse(x_du, x_true)
-            results[alpha].append(rmse)
-
-        collector.add_sensitivity('alpha_tau', alpha,
-                                  np.mean(results[alpha]), np.std(results[alpha]), n_seeds)
-        print("done")
-
-    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    means = [np.mean(results[a]) for a in alpha_tau_list]
-    stds = [np.std(results[a]) for a in alpha_tau_list]
-    ax.errorbar(alpha_tau_list, means, yerr=stds, marker='^',
-                color='#4DAF4A', capsize=3, linewidth=1.5, markersize=7)
-    ax.axvline(1.0, color='gray', linestyle='--', alpha=0.7, label='Default (1.0)')
-    ax.set_xlabel(r'Delay Step Scale $\alpha_\tau$')
-    ax.set_ylabel('RMSE')
-    ax.set_xscale('log')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    save_figure(fig, 'fig_sensitivity_tau')
-
-
 # ============================================================================
-# 辅助图
+# 辅助图 (2张)
 # ============================================================================
-
-def fig_improvement_bar():
-    """改进百分比柱状图"""
-    print("\nFig: Improvement Bar")
-
-    cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
-    model = THzISACModel(cfg)
-    x0 = np.array([1.0, 0.5, 0.0])
-    P0 = np.eye(3) * 0.1
-    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 30, 100
-
-    methods = ['EKF', 'IEKF-4', 'GN-6', 'DU-tun-6']
-    all_rmse = {m: [] for m in methods}
-
-    for seed in range(n_seeds):
-        print(f"  Seed {seed + 1}/{n_seeds}...", end="\r", flush=True)
-        y_seq, x_true, _, _ = generate_episode_with_impairments(
-            model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
-
-        for method in methods:
-            x_hat = run_estimator(method, model, y_seq, x0, P0)
-            rmse, _ = compute_rmse(x_hat, x_true)
-            all_rmse[method].append(rmse)
-
-    means = [np.mean(all_rmse[m]) for m in methods]
-    sems = [np.std(all_rmse[m]) / np.sqrt(n_seeds) for m in methods]
-
-    for m in methods:
-        collector.add_auxiliary('improvement_bar', method=m,
-                                mean=np.mean(all_rmse[m]),
-                                std=np.std(all_rmse[m]),
-                                n_seeds=n_seeds)
-
-    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
-    colors = [COLORS[m] for m in methods]
-    bars = ax.bar(range(len(methods)), means, yerr=sems,
-                  color=colors, alpha=0.8, capsize=3, edgecolor='black', linewidth=0.5)
-
-    ax.set_xticks(range(len(methods)))
-    ax.set_xticklabels(methods, fontsize=IEEE_FONTSIZE - 1)
-    ax.set_ylabel('RMSE')
-    ax.grid(True, alpha=0.3, axis='y')
-
-    for i in range(1, len(methods)):
-        imp = (means[0] - means[i]) / means[0] * 100
-        ax.annotate(f'{imp:+.0f}%', xy=(i, means[i]), xytext=(i, means[i] * 0.9),
-                    fontsize=8, ha='center', color=colors[i], fontweight='bold')
-    print()
-    save_figure(fig, 'fig_improvement_bar')
-
 
 def fig_ccdf():
-    """相位误差 CCDF"""
+    """
+    辅助图1: 相位误差CCDF (互补累积分布函数)
+    展示尾部性能
+    """
     print("\nFig: CCDF")
 
     cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
@@ -1198,6 +1053,7 @@ def fig_ccdf():
                                 p99=np.percentile(errs, 99),
                                 n_samples=len(errs))
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     for method in methods:
         sorted_err = np.sort(all_errors[method])
@@ -1217,7 +1073,10 @@ def fig_ccdf():
 
 
 def fig_pcrb_nt():
-    """PCRB vs n_t"""
+    """
+    辅助图2: PCRB vs n_t (时间导频数)
+    理论分析支撑
+    """
     print("\nFig: PCRB vs n_t")
 
     n_t_values = [1, 2, 4, 8, 16]
@@ -1245,6 +1104,7 @@ def fig_pcrb_nt():
                                 sqrt_pcrb_nu=sqrt_nu,
                                 sqrt_pcrb_phi=sqrt_phi)
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
     ax.semilogy(n_t_values, pcrb_tau, 'o-', label=r'$\tau$', color='#1f77b4')
     ax.semilogy(n_t_values, pcrb_nu, 's-', label=r'$\nu$', color='#ff7f0e')
@@ -1258,33 +1118,39 @@ def fig_pcrb_nt():
 
 
 # ============================================================================
-# ★★★ 新增：THz-Specific 主文图 ★★★
+# ★★★ THz-ISL 特性图 (4张 - 核心新增) ★★★
 # ============================================================================
 
-def fig_thz_phase_sensitivity():
+def fig_thz_vs_mmwave():
     """
-    THz-Specific图1: 相位敏感度随载频scaling
+    THz图1: THz vs mmWave 综合对比
+    展示不同载频下各方法的Phase RMSE，证明THz方法必要性
 
-    通过调整slip概率模拟不同载频下的PN效应
+    关键点：
+    - 300GHz相位敏感度是10GHz的30倍
+    - DU-MAP在高频优势更明显
     """
-    print("\nFig: THz Phase Sensitivity Scaling")
+    print("\nFig: THz vs mmWave Comprehensive")
 
     fc_list = [10, 60, 100, 300]  # GHz
-    p_slip_base = 0.005
-
     methods = ['EKF', 'IEKF-4', 'GN-6', 'DU-tun-6']
 
-    results = {fc: {m: [] for m in methods} for fc in fc_list}
+    # 根据载频调整相位噪声强度（模拟实际物理）
+    # 相位噪声 ∝ f_c^2
+    pn_base = 0.005  # 10GHz时的slip概率
 
     x0 = np.array([1.0, 0.5, 0.0])
     P0 = np.eye(3) * 0.1
-    n_seeds, n_frames = 20, 100
+    n_seeds, n_frames = 25, 100
+
+    results = {fc: {m: [] for m in methods} for fc in fc_list}
 
     for fc in fc_list:
+        # 相位噪声强度随载频平方增长
         pn_scaling = (fc / 10) ** 2
-        p_slip = min(p_slip_base * np.sqrt(pn_scaling), 0.15)
+        p_slip = min(pn_base * np.sqrt(pn_scaling), 0.15)
 
-        print(f"  f_c = {fc} GHz, p_slip = {p_slip:.3f}...", end=" ", flush=True)
+        print(f"  f_c = {fc} GHz (p_slip={p_slip:.3f})...", end=" ", flush=True)
 
         cfg = create_thz_config(n_f=8, n_t=4, snr_db=10, adc_bits=4)
         model = THzISACModel(cfg)
@@ -1300,19 +1166,19 @@ def fig_thz_phase_sensitivity():
                 results[fc][method].append(rmse)
 
         for m in methods:
-            collector.add_performance('thz_phase_sensitivity', 'fc_GHz', fc, m,
+            collector.add_performance('thz_vs_mmwave', 'fc_GHz', fc, m,
                                       'Phase_RMSE', np.mean(results[fc][m]),
                                       np.std(results[fc][m]), n_seeds, n_frames)
         print("done")
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
 
     for method in methods:
         means = [np.mean(results[fc][method]) for fc in fc_list]
         stds = [np.std(results[fc][method]) for fc in fc_list]
-        marker = 'x' if method == 'EKF' else 's' if method == 'GN-6' else 'D'
         ax.errorbar(fc_list, means, yerr=stds,
-                    color=COLORS[method], marker=marker,
+                    color=COLORS[method], marker=MARKERS[method],
                     label=method, capsize=3, linewidth=1.2)
 
     ax.set_xlabel('Carrier Frequency $f_c$ (GHz)')
@@ -1320,43 +1186,230 @@ def fig_thz_phase_sensitivity():
     ax.set_xscale('log')
     ax.set_xticks(fc_list)
     ax.set_xticklabels([str(fc) for fc in fc_list])
-    ax.legend(loc='upper left')
+    ax.legend(loc='upper left', fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.annotate('PN $\\propto f_c^2$', xy=(100, 0.5), fontsize=8, style='italic')
 
-    save_figure(fig, 'fig_thz_phase_sensitivity')
+    # 添加注释
+    ax.annotate('Phase noise $\\propto f_c^2$', xy=(60, 0.4), fontsize=7,
+                style='italic', color='gray')
+
+    # 计算并标注改进
+    du_10 = np.mean(results[10]['DU-tun-6'])
+    du_300 = np.mean(results[300]['DU-tun-6'])
+    ekf_300 = np.mean(results[300]['EKF'])
+    imp = (ekf_300 - du_300) / ekf_300 * 100
+    ax.annotate(f'DU: {imp:.0f}% better\n@ 300GHz', xy=(300, du_300 * 1.1),
+                fontsize=6, ha='center', color=COLORS['DU-tun-6'])
+
+    save_figure(fig, 'fig_thz_vs_mmwave')
 
 
-def fig_thz_doppler_squint():
+def fig_pointing_jitter_impact():
     """
-    THz-Specific图2: Doppler Squint影响验证
+    THz图2: Pointing Jitter影响分析
+
+    ISL特有问题：卫星姿态抖动导致波束指向误差
+    分析不同抖动程度下的性能
     """
-    print("\nFig: THz Doppler Squint Validation")
+    print("\nFig: Pointing Jitter Impact")
 
-    bandwidth_list = [100e6, 300e6, 500e6, 1e9]
-    f_c = 300e9
-
-    methods = ['GN-6', 'DU-tun-6']
-    results_no_sq = {B: {m: [] for m in methods} for B in bandwidth_list}
-    results_sq = {B: {m: [] for m in methods} for B in bandwidth_list}
+    jitter_std_list = [0.0, 0.05, 0.1, 0.2, 0.5]  # degrees
+    methods = ['EKF', 'GN-6', 'DU-tun-6']
 
     x0 = np.array([1.0, 0.5, 0.0])
     P0 = np.eye(3) * 0.1
     slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
-    n_seeds, n_frames = 15, 100
+    n_seeds, n_frames = 25, 100
+
+    results_rmse = {j: {m: [] for m in methods} for j in jitter_std_list}
+    results_ber = {j: {m: [] for m in methods} for j in jitter_std_list}
+
+    for jitter_std in jitter_std_list:
+        print(f"  Jitter σ = {jitter_std}°...", end=" ", flush=True)
+
+        cfg = create_thz_config(
+            n_f=8, n_t=4, snr_db=10, adc_bits=4,
+            enable_pointing_jitter=(jitter_std > 0),
+            pointing_jitter_std_deg=jitter_std if jitter_std > 0 else 0.1
+        )
+        model = THzISACModel(cfg)
+
+        for seed in range(n_seeds):
+            y_seq, x_true, _, _ = generate_episode_with_impairments(
+                model, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
+
+            for method in methods:
+                x_hat = run_estimator(method, model, y_seq, x0, P0)
+                rmse, _ = compute_rmse(x_hat, x_true)
+                ber, _ = quick_ber_evm(x_true, x_hat, 10, seed)
+                results_rmse[jitter_std][method].append(rmse)
+                results_ber[jitter_std][method].append(ber * 100)
+
+        for m in methods:
+            collector.add_performance('pointing_jitter', 'jitter_std_deg', jitter_std, m,
+                                      'RMSE', np.mean(results_rmse[jitter_std][m]),
+                                      np.std(results_rmse[jitter_std][m]), n_seeds, n_frames)
+            collector.add_performance('pointing_jitter', 'jitter_std_deg', jitter_std, m,
+                                      'BER_pct', np.mean(results_ber[jitter_std][m]),
+                                      np.std(results_ber[jitter_std][m]), n_seeds, n_frames)
+        print("done")
+
+    # 绘图: 双Y轴 (RMSE和BER)
+    fig, ax1 = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
+
+    # RMSE (左Y轴)
+    for method in methods:
+        means = [np.mean(results_rmse[j][method]) for j in jitter_std_list]
+        ax1.plot(jitter_std_list, means, marker=MARKERS.get(method, 'o'),
+                 color=COLORS[method], label=f'{method}', linewidth=1.2)
+
+    ax1.set_xlabel('Pointing Jitter $\\sigma_\\theta$ (deg)')
+    ax1.set_ylabel('RMSE')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='upper left', fontsize=7)
+
+    # 标记典型ISL规格
+    ax1.axvline(0.1, color='gray', linestyle='--', alpha=0.5)
+    ax1.annotate('Typical ISL\nspec', xy=(0.1, ax1.get_ylim()[1] * 0.9),
+                 fontsize=6, ha='center', color='gray')
+
+    save_figure(fig, 'fig_pointing_jitter_impact')
+
+
+def fig_beam_squint_wideband():
+    """
+    THz图3: 大带宽下的Beam Squint影响
+
+    分析不同带宽下beam squint对性能的影响
+    在pilot带宽(100MHz)影响小，但wideband数据(1-10GHz)影响显著
+    """
+    print("\nFig: Beam Squint Wideband Analysis")
+
+    bandwidth_list = [100e6, 500e6, 1e9, 2e9, 5e9, 10e9]  # Hz
+    methods = ['GN-6', 'DU-tun-6']
+
+    x0 = np.array([1.0, 0.5, 0.0])
+    P0 = np.eye(3) * 0.1
+    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
+    n_seeds, n_frames = 20, 100
+
+    # 存储有/无beam squint的结果
+    results_no_bs = {B: {m: [] for m in methods} for B in bandwidth_list}
+    results_bs = {B: {m: [] for m in methods} for B in bandwidth_list}
+
+    for B in bandwidth_list:
+        print(f"  B = {B / 1e9:.1f} GHz...", end=" ", flush=True)
+
+        # 无beam squint
+        cfg_no = create_thz_config(
+            n_f=8, n_t=4, snr_db=10, adc_bits=4,
+            bandwidth_hz=B, enable_beam_squint=False
+        )
+        model_no = THzISACModel(cfg_no)
+
+        # 有beam squint (64天线, 15°指向)
+        cfg_bs = create_thz_config(
+            n_f=8, n_t=4, snr_db=10, adc_bits=4,
+            bandwidth_hz=B, enable_beam_squint=True,
+            beam_squint_n_ant=64, beam_squint_theta0_deg=15.0
+        )
+        model_bs = THzISACModel(cfg_bs)
+
+        for seed in range(n_seeds):
+            # 无beam squint
+            y_seq, x_true, _, _ = generate_episode_with_impairments(
+                model_no, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
+            for method in methods:
+                x_hat = run_estimator(method, model_no, y_seq, x0, P0)
+                rmse = compute_phase_rmse(x_hat, x_true)
+                results_no_bs[B][method].append(rmse)
+
+            # 有beam squint
+            y_seq, x_true, _, _ = generate_episode_with_impairments(
+                model_bs, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
+            for method in methods:
+                x_hat = run_estimator(method, model_bs, y_seq, x0, P0)
+                rmse = compute_phase_rmse(x_hat, x_true)
+                results_bs[B][method].append(rmse)
+
+        # 计算性能下降
+        for m in methods:
+            no_bs = np.mean(results_no_bs[B][m])
+            bs = np.mean(results_bs[B][m])
+            degradation = (bs - no_bs) / no_bs * 100
+            collector.add_performance('beam_squint', 'bandwidth_GHz', B / 1e9, m,
+                                      'degradation_pct', degradation,
+                                      0, n_seeds, n_frames)
+            print(f"{m}: {degradation:+.1f}%", end=" ")
+        print()
+
+    # 绘图
+    fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
+
+    for method in methods:
+        degradations = []
+        for B in bandwidth_list:
+            no_bs = np.mean(results_no_bs[B][method])
+            bs = np.mean(results_bs[B][method])
+            degradation = (bs - no_bs) / no_bs * 100
+            degradations.append(degradation)
+
+        marker = 's' if method == 'GN-6' else 'D'
+        ax.plot([B / 1e9 for B in bandwidth_list], degradations,
+                marker=marker, color=COLORS[method], label=method, linewidth=1.2)
+
+    ax.axhline(y=5, color='red', linestyle='--', alpha=0.7, label='5% threshold')
+    ax.set_xlabel('Bandwidth $B$ (GHz)')
+    ax.set_ylabel('RMSE Degradation due to Beam Squint (%)')
+    ax.set_xscale('log')
+    ax.legend(loc='upper left', fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # 标记pilot和wideband区域
+    ax.axvspan(0.05, 0.2, alpha=0.1, color='green')
+    ax.axvspan(1, 10, alpha=0.1, color='red')
+    ax.text(0.1, ax.get_ylim()[1] * 0.8, 'Pilot\nband', fontsize=6, ha='center', color='green')
+    ax.text(3, ax.get_ylim()[1] * 0.8, 'Wideband\ndata', fontsize=6, ha='center', color='red')
+
+    save_figure(fig, 'fig_beam_squint_wideband')
+
+
+def fig_doppler_squint_validation():
+    """
+    THz图4: Doppler Squint验证
+
+    验证Doppler squint建模的正确性和影响
+    """
+    print("\nFig: Doppler Squint Validation")
+
+    bandwidth_list = [100e6, 300e6, 500e6, 1e9]
+    methods = ['GN-6', 'DU-tun-6']
+
+    x0 = np.array([1.0, 0.5, 0.0])
+    P0 = np.eye(3) * 0.1
+    slip_cfg = SlipConfig.killer_pi(p_slip=0.05)
+    n_seeds, n_frames = 20, 100
+
+    results_no_sq = {B: {m: [] for m in methods} for B in bandwidth_list}
+    results_sq = {B: {m: [] for m in methods} for B in bandwidth_list}
 
     for B in bandwidth_list:
         print(f"  B = {B / 1e6:.0f} MHz...", end=" ", flush=True)
 
+        # 无Doppler squint
         cfg_no = THzISACConfig(n_f=8, n_t=4, snr_db=10, adc_bits=4,
-                               bandwidth_hz=B, enable_doppler_squint=False)
+                               bandwidth_hz=B, enable_doppler_squint=False,
+                               enable_continuous_pn=True, pn_linewidth_hz=100.0)
         model_no = THzISACModel(cfg_no)
 
+        # 有Doppler squint
         cfg_sq = THzISACConfig(n_f=8, n_t=4, snr_db=10, adc_bits=4,
-                               bandwidth_hz=B, enable_doppler_squint=True)
+                               bandwidth_hz=B, enable_doppler_squint=True,
+                               enable_continuous_pn=True, pn_linewidth_hz=100.0)
         model_sq = THzISACModel(cfg_sq)
 
         for seed in range(n_seeds):
+            # 无Doppler squint
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model_no, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
             for method in methods:
@@ -1364,6 +1417,7 @@ def fig_thz_doppler_squint():
                 rmse = compute_phase_rmse(x_hat, x_true)
                 results_no_sq[B][method].append(rmse)
 
+            # 有Doppler squint
             y_seq, x_true, _, _ = generate_episode_with_impairments(
                 model_sq, n_frames, x0, slip_cfg=slip_cfg, pn_cfg=None, seed=seed)
             for method in methods:
@@ -1375,9 +1429,12 @@ def fig_thz_doppler_squint():
             no_sq = np.mean(results_no_sq[B][m])
             sq = np.mean(results_sq[B][m])
             impact = (sq - no_sq) / no_sq * 100
+            collector.add_performance('doppler_squint', 'bandwidth_MHz', B / 1e6, m,
+                                      'impact_pct', impact, 0, n_seeds, n_frames)
             print(f"{m}: {impact:+.2f}%", end=" ")
         print()
 
+    # 绘图
     fig, ax = plt.subplots(figsize=(IEEE_WIDTH, IEEE_HEIGHT))
 
     for method in methods:
@@ -1394,15 +1451,17 @@ def fig_thz_doppler_squint():
 
     ax.axhline(y=1, color='gray', linestyle='--', alpha=0.7, label='1% threshold')
     ax.set_xlabel('Pilot Bandwidth $B$ (MHz)')
-    ax.set_ylabel('RMSE Increase due to Squint (%)')
+    ax.set_ylabel('RMSE Impact due to Doppler Squint (%)')
     ax.set_xscale('log')
-    ax.legend(loc='upper left')
+    ax.legend(loc='upper left', fontsize=7)
     ax.grid(True, alpha=0.3)
-    ax.set_ylim([-0.5, 2])
-    ax.axvspan(50, 200, alpha=0.1, color='green')
-    ax.text(100, 1.5, 'Pilot subband\n(negligible)', fontsize=7, ha='center', color='green')
 
-    save_figure(fig, 'fig_thz_doppler_squint')
+    # 标记pilot subband
+    ax.axvspan(50, 200, alpha=0.1, color='green')
+    ax.text(100, ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.8,
+            'Pilot subband\n(negligible)', fontsize=6, ha='center', color='green')
+
+    save_figure(fig, 'fig_doppler_squint_validation')
 
 
 # ============================================================================
@@ -1410,72 +1469,92 @@ def fig_thz_doppler_squint():
 # ============================================================================
 
 def main():
+    """主函数：生成所有图像"""
     print("=" * 70)
-    print("IEEE 格式图像生成 - V3 完整物理模型版")
+    print("IEEE 格式图像生成 - V9 THz-ISL增强版")
     print("=" * 70)
     print()
-    print("★ V3物理效应：")
-    print("  - P0: 连续PN Wiener模型（linewidth=100Hz）")
-    print("  - P0: Doppler squint")
-    print("  - P1/P2: Beam squint & Pointing jitter（stress-test）")
+    print("★ 物理效应：")
+    print("  - 连续PN Wiener模型（linewidth=100Hz）")
+    print("  - Doppler squint")
+    print("  - Beam squint (64-ULA)")
+    print("  - Pointing jitter (ISL特有)")
+    print()
+    print("★ 对比方法：")
+    print("  - EKF (基线)")
+    print("  - IEKF-4 (迭代EKF)")
+    print("  - GN-6 (Gauss-Newton MAP)")
+    print("  - DU-tun-6 (Deep-Unfolded MAP)")
     print()
     print("=" * 70)
 
     setup_ieee_style()
 
-    # 核心图
-    print("\n[核心图]")
-    fig_ber_vs_snr()
-    fig_rmse_vs_snr()
-    fig_rmse_vs_L()
-    fig_recovery_time()
-    fig_slip_2d_heatmap()
-    fig_phase_tracking()
+    # ==================== 核心图 (6张) ====================
+    print("\n[核心图 - 6张]")
+    fig_ber_vs_snr()  # Fig.3: BER vs SNR
+    fig_rmse_vs_snr()  # Fig.4: RMSE vs SNR (含PCRB)
+    fig_rmse_vs_L()  # Fig.5: RMSE vs L
+    fig_recovery_time()  # Fig.6: 恢复时间箱线图
+    fig_slip_heatmap_combined()  # Fig.7: Slip热力图 (合并版)
+    fig_phase_tracking()  # Fig.8: 相位跟踪轨迹
 
-    # BER系列图
-    print("\n[BER系列图]")
-    fig_ber_vs_L()
-    fig_ber_vs_L_multiSNR()
-    fig_ber_vs_pslip()
-    fig_ber_vs_adc()
-    fig_phase_rmse_vs_frame_duration()
+    # ==================== BER系列 (3张) ====================
+    print("\n[BER系列图 - 3张]")
+    fig_ber_vs_L()  # Fig.9: BER vs L
+    fig_ber_vs_pslip()  # Fig.10: BER vs p_slip
+    fig_ber_vs_adc()  # Fig.11: BER vs ADC bits
 
-    # 敏感性分析
-    print("\n[敏感性分析]")
-    fig_sensitivity_phi()
-    fig_sensitivity_nu()
-    fig_sensitivity_tau()
+    # ==================== 敏感性分析 (1张) ====================
+    print("\n[敏感性分析 - 1张]")
+    fig_sensitivity_phi()  # Fig.12: φ步长敏感性
 
-    # 辅助图
-    print("\n[辅助图]")
-    fig_improvement_bar()
-    fig_ccdf()
-    fig_pcrb_nt()
+    # ==================== 辅助图 (2张) ====================
+    print("\n[辅助图 - 2张]")
+    fig_ccdf()  # Fig.13: CCDF
+    fig_pcrb_nt()  # Fig.14: PCRB vs n_t
 
-    # ★★★ THz-Specific 主文图 ★★★
-    print("\n[THz-Specific 主文图]")
-    fig_thz_phase_sensitivity()
-    fig_thz_doppler_squint()
+    # ==================== THz-ISL特性图 (4张 - 关键新增) ====================
+    print("\n[THz-ISL特性图 - 4张] ★ 应对审稿人")
+    fig_thz_vs_mmwave()  # Fig.15: THz vs mmWave对比 (关键!)
+    fig_pointing_jitter_impact()  # Fig.16: Pointing jitter影响
+    fig_beam_squint_wideband()  # Fig.17: Beam squint大带宽分析
+    fig_doppler_squint_validation()  # Fig.18: Doppler squint验证
 
-    # 保存CSV数据
+    # ==================== 保存CSV数据 ====================
     print("\n" + "=" * 70)
     print("保存CSV数据...")
     collector.save_all()
 
+    # ==================== 总结 ====================
     print("\n" + "=" * 70)
     print(f"完成! 输出目录: {OUTPUT_DIR}/")
     print("=" * 70)
-    print("\n生成的图像 (共20+张):")
-    print("  - 核心图: fig_ber_vs_snr, fig_rmse_vs_snr, ...")
-    print("  - BER系列: fig_ber_vs_L, fig_ber_vs_pslip, ...")
-    print("  - 敏感性: fig_sensitivity_phi/nu/tau")
-    print("  - 辅助图: fig_ccdf, fig_pcrb_nt, ...")
-    print("  - ★THz图: fig_thz_phase_sensitivity, fig_thz_doppler_squint")
+
+    print("\n生成的图像 (共16张):")
+    print("  [核心图 - 6张]")
+    print("    fig_ber_vs_snr, fig_rmse_vs_snr, fig_rmse_vs_L,")
+    print("    fig_recovery_time, fig_slip_heatmap_improvement, fig_phase_tracking")
+    print("  [BER系列 - 3张]")
+    print("    fig_ber_vs_L, fig_ber_vs_pslip, fig_ber_vs_adc")
+    print("  [敏感性 - 1张]")
+    print("    fig_sensitivity_phi")
+    print("  [辅助图 - 2张]")
+    print("    fig_ccdf, fig_pcrb_nt")
+    print("  [THz-ISL特性 - 4张] ★")
+    print("    fig_thz_vs_mmwave, fig_pointing_jitter_impact,")
+    print("    fig_beam_squint_wideband, fig_doppler_squint_validation")
+
     print("\nCSV数据文件:")
     print("  - data_performance.csv")
     print("  - data_sensitivity.csv")
     print("  - data_heatmap.csv")
     print("  - data_auxiliary.csv")
+
+    print("\n★ 相比V8的变化:")
+    print("  [删除] ber_vs_L_multiSNR, sensitivity_nu, sensitivity_tau, improvement_bar")
+    print("  [新增] thz_vs_mmwave, pointing_jitter_impact, beam_squint_wideband")
+    print("  [改进] slip_heatmap → slip_heatmap_improvement (合并版)")
 
 
 if __name__ == "__main__":
